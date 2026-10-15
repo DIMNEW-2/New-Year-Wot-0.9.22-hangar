@@ -14,8 +14,13 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+TOOLS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
+if TOOLS not in sys.path:
+    sys.path.insert(0, TOOLS)
+
+import check_client_assets as checker  # noqa: E402
 import common  # noqa: E402
-from server import doctor  # noqa: E402
+from server import doctor, loader  # noqa: E402
 
 
 def _report(source, **kwargs):
@@ -97,6 +102,84 @@ def test_the_parser_offers_verify(runner: common.Runner) -> None:
     runner.equal(args.command, "verify", "the command is parsed")
     runner.check(callable(getattr(cli, "_command_verify", None)),
                  "and has an entry point")
+
+
+# ---------------------------------------------------------------------------
+# the paths that only a packed (release) installation takes
+# ---------------------------------------------------------------------------
+def _packed_installation(source: str, root: str, space: bool = True) -> str:
+    """A ``res/scripts.pkg``-shaped archive of an unpacked ``scripts`` folder."""
+    import shutil
+    import zipfile
+
+    scripts = loader.find_client(source).scripts
+    packages = os.path.join(root, "res", "packages")
+    os.makedirs(packages)
+    archive_path = os.path.join(root, "res", "scripts.pkg")
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        prefix = "scripts/"
+        for folder, _dirs, files in os.walk(scripts):
+            for name in files:
+                if not name.endswith((".xml", ".py")):
+                    continue
+                path = os.path.join(folder, name)
+                archive.write(path, prefix + os.path.relpath(path, scripts).replace(os.sep, "/"))
+        if space:
+            archive.writestr("spaces/h07_newyear_2015/space.settings",
+                             "<root><hangarSettings/></root>")
+    return root
+
+
+def test_the_hangar_space_is_found_in_a_package(runner: common.Runner) -> None:
+    """``find_hangar_space`` looks inside the packages, not only at file names."""
+    import tempfile
+
+    root = tempfile.mkdtemp(prefix="wotny-packed-client-")
+    try:
+        _packed_installation(runner.client, root)
+        found, detail = doctor.find_hangar_space(root)
+        runner.check(found, "the space was found: %s" % detail)
+        runner.check("space.settings" in detail, "and the report names the member")
+    finally:
+        import shutil
+
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_a_packed_installation_is_fully_checked(runner: common.Runner) -> None:
+    """A release layout (scripts.pkg, packages) passes the whole check."""
+    import tempfile
+
+    root = tempfile.mkdtemp(prefix="wotny-packed-client-")
+    try:
+        _packed_installation(runner.client, root)
+        with open(os.path.join(root, "res", "packages", "h07_newyear_2015.pkg"), "wb"):
+            pass  # an (empty) package named after the space is enough
+        code, report = _report(root)
+        runner.equal(code, 0, "the packed installation is green:\n%s" % report)
+        runner.check("the New Year hangar space" in report, "the space check ran")
+        runner.check("New Year definitions" in report, "the catalogue was read")
+    finally:
+        import shutil
+
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_the_table_checker_reads_a_packed_installation(runner: common.Runner) -> None:
+    """``tools/check_client_assets.py`` reads the client sources from the archive."""
+    import tempfile
+
+    root = tempfile.mkdtemp(prefix="wotny-packed-client-")
+    try:
+        _packed_installation(runner.client, root, space=False)
+        output = io.StringIO()
+        status = checker.check(root, stream=output)
+        report = output.getvalue()
+        runner.equal(status, 0, "the packed client agrees with the tables:\n%s" % report)
+    finally:
+        import shutil
+
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def main(argv=None) -> int:
