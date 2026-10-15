@@ -101,7 +101,30 @@ What works today, and what is still missing or unverified.
   client's packages.  If a build ships another space name, change
   `server/game/events.py::NEW_YEAR_HANGAR_PATH` (the client's own
   `gui/hangars.xml` `default_hangar` is a good hint).
-* **Battles** are out of scope: no `Avatar`, no arena, no battle results.
+* **Battles** are out of scope: no `Avatar`, no arena, no battle results.  The
+  client's battle commands (`CMD_ENQUEUE_*`, the platoon/`CMD_PRB_*` family, the
+  queue info requests) are answered with ``unknown_command``, so the buttons
+  that lead into a battle report a server error instead of doing nothing.
+* **The appearance UI (customization) is not implemented yet.**  The client
+  sends `CMD_BUY_C11N_ITEMS` (118), `CMD_SELL_C11N_ITEMS` (117),
+  `CMD_VEH_APPLY_OUTFIT` (119) and `CMD_VEH_APPLY_STYLE` (116); none of them has
+  a handler, `inventory['customization']` (the `CustomizationInvData` sections
+  `ITEMS`/`OUTFITS`/`UNLOCKS`) is not published, and the camouflage/emblem prices
+  of `item_defs/customization/**` are not part of the shop cache.  Camouflage
+  rewards that the New Year bonuses name are therefore only shown, not handed
+  out.  The data is all in the installation: `customization/priceGroups/list.xml`
+  prices the items and every item folder
+  (`paints`/`camouflages`/`decals`) has its own `list.xml`.
+* **The barracks commands are not implemented yet** (`CMD_DISMISS_TMAN`,
+  `CMD_TMAN_ADD_SKILL`, `CMD_TMAN_CHANGE_ROLE`, `CMD_TMAN_RESPEC`,
+  `CMD_TMAN_DROP_SKILLS`, `CMD_TMAN_MULTI_RESPEC`, `CMD_TMAN_RESTORE`,
+  `CMD_TMAN_PASSPORT`, `CMD_TRAINING_TMAN`, `CMD_RETURN_CREW`).  Crew can be
+  moved between vehicles and seats (`CMD_EQUIP_TMAN`, `CMD_BUY_AND_EQUIP_TMAN`)
+  and dismissed through the client only.
+* **Dossiers and profile** (`CMD_REQ_ACCOUNT_DOSSIER`, `CMD_REQ_VEHICLE_DOSSIER`,
+  `CMD_SET_DOSSIER_FIELD`, `CMD_SELECT_BADGES`, the global rating requests) are
+  not answered: the statistics and profile screens stay empty.  Also
+  unimplemented: `CMD_VEHICLE_TRADE_IN` and `CMD_QUERY_BALANCE_INFO`.
 * **The shop** prices what `item_defs` prices; personal discounts and boosters
   (`goodies`) beyond the New Year ones are not implemented.
 * **Goodies definitions** (`scripts/server_xml/goodies.xml`) are server-side
