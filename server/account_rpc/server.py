@@ -84,6 +84,20 @@ class Session:
                 "ext": response.ext_blob(),
             }
         )
+        # A streamed answer follows its response: the client subscribes to the
+        # request id when it sees ``RES_STREAM`` and unpacks the stream with the
+        # callback of ``Account.onStreamComplete``.
+        stream = response.stream_blob()
+        if stream is not None:
+            header, payload = stream
+            self.send(
+                {
+                    "type": "stream",
+                    "requestID": int(request_id),
+                    "desc": tuple(header),
+                    "data": payload,
+                }
+            )
 
     def send_welcome(self, diff: dict) -> None:
         self.send(

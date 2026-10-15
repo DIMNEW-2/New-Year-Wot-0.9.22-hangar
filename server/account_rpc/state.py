@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from ..game import items as items_module
 from ..game import new_year as ny_module
 from ..game import ny_constants as nyc
+from ..game import shop as shop_module
 from ..game import rewards as rewards_module
 from ..game import tankmen as tankmen_module
 from ..game import vehicle_descr as descr_module
@@ -164,6 +165,7 @@ class AccountState:
         )
         self.revision = 1
         self._notifications: List[dict] = []
+        self._shop_builder = None
 
     # ------------------------------------------------------------------
     # Building the starting account
@@ -467,6 +469,12 @@ class AccountState:
             self.events.set_new_year_state(self.new_year.state.state)
             diff[("eventsData", "_r")] = self.events.events_data_diff()
         return diff
+
+    def shop_payload(self) -> dict:
+        """The shop cache (``CMD_SYNC_SHOP``, streamed to the client)."""
+        if self._shop_builder is None:
+            self._shop_builder = shop_module.ShopBuilder(self.catalog)
+        return self._shop_builder.payload()
 
     def server_settings(self) -> Dict[str, Any]:
         """The ``serverSettings`` the client's lobby reads at startup.

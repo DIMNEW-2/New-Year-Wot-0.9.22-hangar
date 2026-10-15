@@ -40,6 +40,7 @@ class Bridge(object):
         self.pending = []
         self.diffs = []
         self.messages = []
+        self.streams = []
 
     def send(self, message) -> None:
         self.writer.write(pack_message(message))
@@ -60,6 +61,7 @@ class Bridge(object):
         response = None
         diffs = []
         actions = []
+        streams = []
         while True:
             message = self.recv()
             kind = message.get("type")
@@ -67,12 +69,15 @@ class Bridge(object):
                 diffs.append(message["diff"])
             elif kind == "sysMessage":
                 actions.append(message["action"])
+            elif kind == "stream":
+                streams.append(message)
             elif kind == "response":
                 response = message
                 break
             else:  # a push from the server between answers
                 self.messages.append(message)
         self.diffs = diffs
+        self.streams = streams
         return response, diffs, actions
 
     def close(self) -> None:
@@ -333,6 +338,45 @@ def test_server_settings_shape(runner: common.Runner) -> None:
 
 def _has_events_data(diff) -> bool:
     return ("eventsData", "_r") in diff
+
+
+def test_shop_sync_is_a_stream(runner: common.Runner) -> None:
+    """``CMD_SYNC_SHOP`` answers with ``RES_STREAM`` and the price cache.
+
+    ``Shop.__onSyncDataReceived`` reads ``sellPriceFactor`` from the unpacked
+    payload and every price lookup asserts the revision of the cache, so both
+    have to travel with the stream; the client subscribes to it through
+    ``Account.onStreamComplete``/``SyncController``.
+    """
+    state = common.new_account(runner.client)
+    server = AccountServer(state, port=0, save_path=None).start()
+    try:
+        bridge = Bridge(server.port)
+        bridge.hello()
+        response, diffs, actions = bridge.command(6, cmd.CMD_SYNC_SHOP, (0, 0, 0))
+        runner.equal(response["code"], cmd.RES_STREAM, "the answer code")
+        # The stream follows its response: ``SyncController`` subscribes to the
+        # request id only after it has seen ``RES_STREAM``.
+        frame = bridge.recv()
+        runner.equal(frame["type"], "stream", "the answer is followed by a stream")
+        runner.equal(frame["requestID"], 6, "the stream belongs to the request")
+        desc = tuple(frame["desc"])
+        runner.equal(len(desc), 5, "the stream header has five fields")
+        runner.check(not desc[0], "the stream is not corrupt")
+        runner.equal(desc[1], desc[2], "the sizes of an uncompressed stream")
+        shop = py2_loads(zlib.decompress(frame["data"]))
+        runner.check("sellPriceFactor" in shop,
+                     "the shop carries the sell price factor the client copies")
+        runner.check(shop["rev"] >= 1, "the shop carries a revision")
+        prices = shop["items"]["itemPrices"]
+        runner.check(len(prices) > 100, "the shop prices the vehicles and modules")
+        vehicle = sorted(state.owned_vehicle_comp_descrs())[0]
+        runner.check(vehicle in prices, "an owned vehicle has a price")
+        runner.check(isinstance(shop.get("defaults"), dict),
+                     "the shop carries the client's defaults")
+        bridge.close()
+    finally:
+        server.stop()
 
 
 def main(argv=None) -> int:

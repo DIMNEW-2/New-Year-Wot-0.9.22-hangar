@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Sequence, Tuple
 
 from ..game import new_year as ny_module
-from ..proto import py2_dumps
+from ..proto import pack_stream, py2_dumps
 from . import commands as cmd
 from . import data as data_module
 from .state import AccountState
@@ -53,9 +53,18 @@ class Response:
     ext: Optional[dict] = None
     diffs: List[dict] = field(default_factory=list)
     actions: List[dict] = field(default_factory=list)
+    #: A streamed answer (``Account.onStreamComplete``); the client subscribes
+    #: to it when the response carries ``RES_STREAM``.
+    stream: Optional[object] = None
 
     def ext_blob(self) -> Optional[bytes]:
         return py2_dumps(self.ext) if self.ext is not None else None
+
+    def stream_blob(self):
+        """``(header, payload)`` of :attr:`stream`, or ``None``."""
+        if self.stream is None:
+            return None
+        return pack_stream(self.stream)
 
 
 def flat_pairs(values: Sequence[int]) -> List[Tuple[int, int]]:
@@ -82,6 +91,7 @@ class RequestDispatcher:
         self._message_id = 0
         self._handlers = {
             cmd.CMD_SYNC_DATA: self.on_sync_data,
+            cmd.CMD_SYNC_SHOP: self.on_sync_shop,
             cmd.CMD_REQ_SERVER_STATS: self.on_server_stats,
             cmd.CMD_NEW_YEAR_OPEN_BOX: self.on_open_box,
             cmd.CMD_NEW_YEAR_SELECT_DISCOUNT: self.on_select_discount,
@@ -98,7 +108,6 @@ class RequestDispatcher:
         #: shop sync, dossiers, ...); answering ``RES_SUCCESS`` keeps it moving
         #: and the log records the fact so real gaps stay visible.
         self._acknowledged = {
-            cmd.CMD_SYNC_SHOP,
             cmd.CMD_ADD_INT_USER_SETTINGS,
             cmd.CMD_SYNC_DOSSIERS,
             cmd.CMD_REPAIR,
@@ -152,6 +161,19 @@ class RequestDispatcher:
 
     def on_server_stats(self, request_id: int, args: Sequence) -> Response:
         return Response(ext=data_module.server_stats())
+
+    def on_sync_shop(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_SYNC_SHOP`` - the client asks for the shop cache.
+
+        The answer is a stream: the client's ``SyncController`` subscribes to the
+        request id when it sees ``RES_STREAM`` and unpacks the payload with
+        ``zlib`` + ``cPickle`` (``Account.onStreamComplete``), which is how
+        ``Shop`` gets its cache and the lobby its prices.
+        """
+        shop = self.state.shop_payload()
+        self.log.info("shop sync: revision %s, %d prices",
+                      shop.get("rev"), len(shop.get("items", {}).get("itemPrices", {})))
+        return Response(code=cmd.RES_STREAM, stream=shop)
 
     # -- New Year event -------------------------------------------------
     def _new_year_response(self, result: ny_module.NewYearResult, diffs: int = 1,

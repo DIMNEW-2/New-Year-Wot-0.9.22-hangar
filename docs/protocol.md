@@ -1,0 +1,60 @@
+# The bridge protocol (client mod ⇄ local server)
+
+The client mod opens one TCP connection to the local server (`127.0.0.1:28422`
+by default).  Every message is
+
+```
+struct('!I', len(payload)) || payload
+payload = zlib.compress(pickle(obj, protocol=2))
+```
+
+The pickle is written by Python 3 (`server/proto/py2pickle.py`) in a way Python
+2.7 loads back unchanged: protocol 2, `str` as `BINUNICODE`, `bytes` through
+`_codecs.encode(data, 'latin1')` so the client sees `str` where it expects
+bytes (vehicle descriptors, `toyCollection`, stream payloads).  The mod writes
+plain Python 2 protocol-2 pickles.
+
+## Client → server
+
+| message | fields | meaning |
+| --- | --- | --- |
+| `hello` | `protocol`, `client` | first message after connecting; the server answers with `welcome` |
+| `cmd` | `requestID`, `code`, `args` | one `Account._doCmd*` call, `args` exactly as the client passed them |
+| `ping` | — | keep-alive (the server answers `pong`) |
+| `bye` | — | the client is going away |
+
+`code` is the client's own `AccountCommands` value (`100` sync, `20161`–`20169`
+the New Year commands, `300` shop sync, …); `args` is a tuple because the mod
+sends `len(args)` values of the matching `doCmd*` helper.
+
+## Server → client
+
+| message | fields | client side |
+| --- | --- | --- |
+| `welcome` | `protocol`, `account` (`name`, `databaseID`), `diff` | the full account snapshot; the mod keeps it for `showGUI` and lets the client's own `CMD_SYNC_DATA` do the sync |
+| `diff` | `diff` | `Account._update(True, diff)` — a full sync when `prevRev` is missing |
+| `sysMessage` | `action` | `Account.onChatAction(action)`: a chat action (21 = `sysMessage`, 22 = `personalSysMessage`), e.g. the `tokenQuests` (29) message that carries a loot box reward |
+| `response` | `requestID`, `code`, `error`, `ext` | `Account.onCmdResponseExt(requestID, code, error, pickle(ext))` when `ext` is set, else `Account.onCmdResponse(…)`; `code` is `RES_SUCCESS` (0), `RES_STREAM` (1), `RES_FAILURE` (-1), … |
+| `stream` | `requestID`, `desc`, `data` | `Account.onStreamComplete(requestID, desc, data)`; `desc` is `(isCorrupted, origPacketLen, packetLen, origCrc32, crc32)` and `data` is `zlib(pickle(obj))`.  Sent *after* the `RES_STREAM` response, because the client subscribes to the id when it sees the code |
+| `pong` | `time` | answer to `ping` |
+
+Order matters within one answered request: the diffs and chat actions first,
+then the response (the client's callback reads the freshly synced caches), then
+the stream, if any.
+
+## Sync contract
+
+* `CMD_SYNC_DATA (100)` is sent by `AccountSyncData` with `(revision, crc, 0)`.
+  A diff without `prevRev` is a full sync (`isFullSync = True`, the client
+  clears its caches first); an incremental diff must echo the revision the
+  client sent in `prevRev`, otherwise it resynchronizes.
+* Sections keyed by a tuple `(name, '_r')` replace the client's cache
+  (`__synchronizeCacheDict`), which is how `eventsData`, `goodies` and
+  `serverSettings` travel; every other key must be a dictionary of dictionaries.
+* `eventsData` values are `zlib(pickle(…))` blobs keyed by
+  `EVENT_CLIENT_DATA` (`QUEST` 3, `ACTION` 1, `INGAME_EVENTS` 7,
+  `NOTIFICATIONS` 9, …).  The notification list is only sent with a full sync:
+  the client reports every entry it receives as freshly added, and a repeated
+  `cmd_change_hangar` reloads the hangar space.
+* New Year tokens are `(expiry, count)` pairs; the client moves the event ones
+  into its own box/chest/discount caches and strips them from the token diff.
