@@ -470,11 +470,121 @@ class AccountState:
             diff[("eventsData", "_r")] = self.events.events_data_diff()
         return diff
 
-    def shop_payload(self) -> dict:
-        """The shop cache (``CMD_SYNC_SHOP``, streamed to the client)."""
+    @property
+    def shop_builder(self) -> shop_module.ShopBuilder:
+        """The shop cache builder of this installation (prices, revisions)."""
         if self._shop_builder is None:
             self._shop_builder = shop_module.ShopBuilder(self.catalog)
-        return self._shop_builder.payload()
+        return self._shop_builder
+
+    def shop_payload(self) -> dict:
+        """The shop cache (``CMD_SYNC_SHOP``, streamed to the client)."""
+        return self.shop_builder.payload()
+
+    def price_of(self, compact_descr: int):
+        """``(credits, gold)`` of one shop item, or ``None`` when it is unpriced."""
+        return self.shop_builder.price(compact_descr)
+
+    # ------------------------------------------------------------------
+    # Items of the depot (shells, equipment, consumables, devices)
+    # ------------------------------------------------------------------
+    def item_count(self, item_type: int, compact_descr: int) -> int:
+        return int(self.items.get(int(item_type), {}).get(int(compact_descr), 0))
+
+    def add_item(self, item_type: int, compact_descr: int, count: int = 1) -> int:
+        """Put ``count`` items of one type into the depot; returns the new count."""
+        values = self.items.setdefault(int(item_type), {})
+        values[int(compact_descr)] = int(values.get(int(compact_descr), 0)) + int(count)
+        return values[int(compact_descr)]
+
+    def remove_item(self, item_type: int, compact_descr: int, count: int = 1) -> int:
+        """Take ``count`` items out of the depot; the entry goes away at zero."""
+        values = self.items.get(int(item_type), {})
+        compact_descr = int(compact_descr)
+        remaining = int(values.get(compact_descr, 0)) - int(count)
+        if remaining > 0:
+            values[compact_descr] = remaining
+        else:
+            values.pop(compact_descr, None)
+        return max(0, remaining)
+
+    def _vehicle_sections(self, entry: "VehicleEntry") -> Dict[str, dict]:
+        """Every ``inventory[1]`` section of one vehicle, keyed by its invID."""
+        inv_id = entry.inv_id
+        sections = {
+            "crew": {inv_id: {tman_id: None for tman_id in entry.crew}},
+            "settings": {inv_id: entry.settings},
+            "eqs": {inv_id: list(entry.equipment)},
+            "eqsLayout": {inv_id: dict(entry.equipment_layout)},
+            "shells": {inv_id: list(entry.shells)},
+            "shellsLayout": {inv_id: dict(entry.shells_layout)},
+            "repair": {inv_id: tuple(entry.repair)},
+            "lock": {inv_id: entry.lock},
+        }
+        vehicle = self._vehicle_type(entry)
+        if vehicle is not None:
+            try:
+                sections["compDescr"] = {inv_id: entry.in_battle_descr(vehicle)}
+            except descr_module.VehicleDescrError:
+                sections["compDescr"] = {}
+        return sections
+
+    def partial_inventory_diff(self, vehicle_inv_ids=(), tankman_inv_ids=(),
+                               item_types=()) -> dict:
+        """A diff with only the named vehicles, crew members and item types.
+
+        A vehicle or a crew member that is no longer in the account travels as
+        ``None``: ``synchronizeDicts`` removes the key from the client's cache.
+        """
+        inventory: Dict = {VEHICLE: {}, TANKMAN: {}}
+        vehicles = inventory[VEHICLE]
+        for inv_id in vehicle_inv_ids:
+            inv_id = int(inv_id)
+            entry = self.vehicles.get(inv_id)
+            if entry is None:
+                for name in ("compDescr", "crew", "settings", "eqs", "eqsLayout",
+                             "shells", "shellsLayout", "repair", "lock"):
+                    vehicles.setdefault(name, {})[inv_id] = None
+                continue
+            for name, section in self._vehicle_sections(entry).items():
+                vehicles.setdefault(name, {}).update(section)
+        tankmen = inventory[TANKMAN]
+        for inv_id in tankman_inv_ids:
+            inv_id = int(inv_id)
+            entry = self.tankmen.get(inv_id)
+            if entry is None:
+                tankmen.setdefault("compDescr", {})[inv_id] = None
+                tankmen.setdefault("vehicle", {})[inv_id] = None
+                continue
+            tankmen.setdefault("compDescr", {})[inv_id] = entry.compact_descr
+            tankmen.setdefault("vehicle", {})[inv_id] = entry.vehicle_inv_id
+        for item_type in item_types:
+            item_type = int(item_type)
+            inventory[item_type] = dict(self.items.get(item_type, {}))
+        return inventory
+
+    def economics_diff(self) -> dict:
+        """The wallet, in the section the client's ``Stats`` reads."""
+        return {
+            "credits": self.credits,
+            "gold": self.gold,
+            "freeXP": self.free_xp,
+        }
+
+    def purchase_stats_diff(self) -> dict:
+        """What changes in ``stats`` when a vehicle is bought or sold.
+
+        The client *grows* ``unlocks``/``eliteVehicles`` from a diff
+        (``Stats.synchronize``), so publishing the full sets is idempotent.
+        """
+        return {
+            "slots": self.slots,
+            "berths": self.berths,
+            "freeXP": self.free_xp,
+            "unlocks": set(self.unlocks),
+            "eliteVehicles": set(self.elite_vehicles),
+            "vehTypeXP": {entry.compact_descr: 0 for entry in self.vehicles.values()},
+        }
 
     def server_settings(self) -> Dict[str, Any]:
         """The ``serverSettings`` the client's lobby reads at startup.

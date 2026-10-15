@@ -33,6 +33,7 @@ from ..game import new_year as ny_module
 from ..proto import pack_stream, py2_dumps
 from . import commands as cmd
 from . import data as data_module
+from . import purchases as purchases_module
 from .state import AccountState
 
 LOG = logging.getLogger("wotny.requests")
@@ -88,10 +89,18 @@ class RequestDispatcher:
     def __init__(self, state: AccountState, logger: logging.Logger = None):
         self.state = state
         self.log = logger or LOG
+        self.shop = purchases_module.Shopkeeper(state)
         self._message_id = 0
         self._handlers = {
             cmd.CMD_SYNC_DATA: self.on_sync_data,
             cmd.CMD_SYNC_SHOP: self.on_sync_shop,
+            cmd.CMD_BUY_VEHICLE: self.on_buy_vehicle,
+            cmd.CMD_BUY_ITEM: self.on_buy_item,
+            cmd.CMD_BUY_TMAN: self.on_buy_tman,
+            cmd.CMD_SELL_VEHICLE: self.on_sell_vehicle,
+            cmd.CMD_SELL_ITEM: self.on_sell_item,
+            cmd.CMD_BUY_SLOT: self.on_buy_slot,
+            cmd.CMD_BUY_BERTHS: self.on_buy_berths,
             cmd.CMD_REQ_SERVER_STATS: self.on_server_stats,
             cmd.CMD_NEW_YEAR_OPEN_BOX: self.on_open_box,
             cmd.CMD_NEW_YEAR_SELECT_DISCOUNT: self.on_select_discount,
@@ -174,6 +183,60 @@ class RequestDispatcher:
         self.log.info("shop sync: revision %s, %d prices",
                       shop.get("rev"), len(shop.get("items", {}).get("itemPrices", {})))
         return Response(code=cmd.RES_STREAM, stream=shop)
+
+    # -- the shop -------------------------------------------------------
+    def _purchase(self, action, *args) -> Response:
+        """Run one shop operation and publish the diff it produced."""
+        try:
+            outcome = action(*args)
+        except purchases_module.PurchaseError as error:
+            self.log.info("shop: refused (%s)", error)
+            return Response(code=error.code, error=error.error)
+        self.log.info("shop: %s -> %s", getattr(action, "__name__", action),
+                      outcome.get("ext") or "ok")
+        response = Response(ext=outcome.get("ext"), diffs=[outcome["diff"]])
+        return response
+
+    def on_buy_vehicle(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_BUY_VEHICLE`` - ``[rev, compDescr, flags, tmanCost, rent]``."""
+        _revision, compact, flags, tman_cost, _rent = purchases_module.parse_buy_vehicle(args)
+        return self._purchase(self.shop.buy_vehicle, compact, flags, tman_cost)
+
+    def on_buy_item(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_BUY_ITEM`` - ``(rev, itemShopID, count, goldForCredits)``."""
+        compact = int(args[1])
+        count = int(args[2]) if len(args) > 2 else 1
+        gold_for_credits = bool(int(args[3])) if len(args) > 3 else False
+        return self._purchase(self.shop.buy_item, compact, count, gold_for_credits)
+
+    def on_buy_tman(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_BUY_TMAN`` - ``(rev, vehTypeCompDescr, roleIdx, tmanCostTypeIdx)``."""
+        compact = int(args[1])
+        role_index = int(args[2]) if len(args) > 2 else 1
+        tman_cost = int(args[3]) if len(args) > 3 else 0
+        return self._purchase(self.shop.buy_tankman, compact, role_index, tman_cost)
+
+    def on_sell_vehicle(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_SELL_VEHICLE`` - ``[rev, vehInvID, dismissCrew, items…]``."""
+        _revision, inv_id, dismiss_crew, from_vehicle, from_inventory = \
+            purchases_module.parse_sell_vehicle(args)
+        return self._purchase(self.shop.sell_vehicle, inv_id, bool(dismiss_crew),
+                              from_vehicle, from_inventory)
+
+    def on_sell_item(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_SELL_ITEM`` - ``(rev, itemTypeIdx, itemInvID, count)``."""
+        item_type = int(args[1])
+        compact = int(args[2])
+        count = int(args[3]) if len(args) > 3 else 1
+        return self._purchase(self.shop.sell_item, item_type, compact, count)
+
+    def on_buy_slot(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_BUY_SLOT`` - one more garage slot."""
+        return self._purchase(self.shop.buy_slot)
+
+    def on_buy_berths(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_BUY_BERTHS`` - one more barracks berth pack."""
+        return self._purchase(self.shop.buy_berths)
 
     # -- New Year event -------------------------------------------------
     def _new_year_response(self, result: ny_module.NewYearResult, diffs: int = 1,

@@ -14,6 +14,11 @@ What works today, and what is still missing or unverified.
   `prevRev`), `CMD_SYNC_SHOP` (streamed price cache), tunnelled
   `CMD_ADD_INT_USER_SETTINGS`, `CMD_REQ_SERVER_STATS`, persistence of the
   account between runs.
+* **The shop** — the price cache the client synchronizes (vehicles, modules,
+  shells, equipment, optional devices, all from the installation's own
+  `item_defs`), buying and selling vehicles and items, garage slots and barracks
+  berths.  Prices, refunds and refusals match what the client's own dialogs
+  show (`Shop.getSellPrice`, `ShopCommonStats`).
 * **Diffs the client reads** — `inventory` (vehicles with their descriptors,
   crew, equipment, shells, settings, locks; tankmen), `stats`, `account`,
   `economics`, `tokens`, `newYear`, `('goodies','_r')`,
@@ -49,10 +54,10 @@ What works today, and what is still missing or unverified.
   `server/game/events.py::NEW_YEAR_HANGAR_PATH` (the client's own
   `gui/hangars.xml` `default_hangar` is a good hint).
 * **Battles** are out of scope: no `Avatar`, no arena, no battle results.
-* **Shop prices** cover vehicles and their modules; shells, consumables,
-  equipment and optional devices are not priced yet (the client shows 0 for
-  them), and there are no personal discounts/boosters beyond the New Year
-  goodies.
+* **The shop** prices what `item_defs` prices; personal discounts and boosters
+  (`goodies`) beyond the New Year ones are not implemented, and the equipment/
+  consumable **purchase** flow that the client's dialog drives
+  (`CMD_BUY_AND_EQUIP_ITEM`) is accepted but only buys, it does not mount.
 * **Goodies definitions** (`scripts/server_xml/goodies.xml`) are server-side
   data of the live game and are not in the client: the event's own variadic
   discounts work, the shop's personal discount list is empty.

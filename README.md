@@ -16,7 +16,16 @@ process, so the game runs offline with a working lobby:
   so the lobby and the carousel work as usual.
 
 Game data is **never** bundled: the server reads the player's own installation
-(`item_defs`), so it always matches the client exactly.
+(`res/scripts/item_defs`, or the same tree inside `res/scripts.pkg` when the
+build ships packed scripts), so it always matches the client exactly.
+
+If the server cannot find the game data, ask it what it sees:
+
+```bash
+python3 -m server inspect --client /path/to/World_of_Tanks
+```
+
+it prints the layout it found (or every place it looked) instead of a traceback.
 
 ## Requirements
 
@@ -76,7 +85,7 @@ Game data is **never** bundled: the server reads the player's own installation
 | `server/game/` | game data (`item_defs` catalog), New Year event logic, quests/actions/notifications, reward payouts |
 | `server/account_rpc/` | account state, command dispatch, protocol constants, socket server, persistence |
 | `server/proto/` | Python-2-compatible pickles and framing |
-| `server/loader.py`, `server/__main__.py` | finding the installation, CLI (`serve`, `info`, `extract`) |
+| `server/loader.py`, `server/__main__.py` | finding the installation (unpacked or packed, nested folders), CLI (`serve`, `info`, `extract`, `inspect`) |
 | `client_mod/` | the in-client mod (bridge + fake login + account proxy) |
 | `tests/` | plain-Python test suite (`python3 tests/run_all.py --client …`) |
 | `docs/` | protocol notes and the event reference |
