@@ -1,0 +1,2 @@
+Реализуй полностью рабочий локальный сервер для игры World_of_Tanks версии 0.09.22.00.01_CH_1513_HD, в котором будет полностью рабочий новогодний ангар, лутбоксы и ивент новогоднее наступление.
+Репозитории, которые могут помочь при разработке:  https://github.com/StranikS-Scan/WorldOfTanks-Decompiled/tree/0.9.22, https://github.com/Fedar459/WoTOfflineHangar0.9.22, https://github.com/pengw0048/wot-offline-battles/tree/main,https://github.com/colorfulmeans/wot-0.9.22-offline-battles
