@@ -105,16 +105,19 @@ What works today, and what is still missing or unverified.
   client's battle commands (`CMD_ENQUEUE_*`, the platoon/`CMD_PRB_*` family, the
   queue info requests) are answered with ``unknown_command``, so the buttons
   that lead into a battle report a server error instead of doing nothing.
-* **The appearance UI (customization) is not implemented yet.**  The client
-  sends `CMD_BUY_C11N_ITEMS` (118), `CMD_SELL_C11N_ITEMS` (117),
-  `CMD_VEH_APPLY_OUTFIT` (119) and `CMD_VEH_APPLY_STYLE` (116); none of them has
-  a handler, `inventory['customization']` (the `CustomizationInvData` sections
-  `ITEMS`/`OUTFITS`/`UNLOCKS`) is not published, and the camouflage/emblem prices
-  of `item_defs/customization/**` are not part of the shop cache.  Camouflage
-  rewards that the New Year bonuses name are therefore only shown, not handed
-  out.  The data is all in the installation: `customization/priceGroups/list.xml`
-  prices the items and every item folder
-  (`paints`/`camouflages`/`decals`) has its own `list.xml`.
+* **The appearance UI (customization) is half done.**  The data is read:
+  `server/game/customization.py` knows every paint, camouflage and decal of the
+  installation with the price of its `<price>` or of the price group it names,
+  its season mask, its `notInShop` flag and its nation/level/tag filter, and
+  `tests/test_customization.py` checks it against the client's own numbering
+  (`makeIntCompactDescrByID('customizationItem', cType, itemId)`).  What is still
+  missing is the account side of it: `inventory['customization']` (the
+  `CustomizationInvData` sections `ITEMS`/`OUTFITS`/`UNLOCKS`) is not published,
+  the item prices are not part of the shop cache yet, and the four commands the
+  client sends - `CMD_BUY_C11N_ITEMS` (118), `CMD_SELL_C11N_ITEMS` (117),
+  `CMD_VEH_APPLY_OUTFIT` (119), `CMD_VEH_APPLY_STYLE` (116) - have no handlers.
+  Camouflage rewards that the New Year bonuses name are therefore only shown,
+  not handed out.
 * **The barracks commands are not implemented yet** (`CMD_DISMISS_TMAN`,
   `CMD_TMAN_ADD_SKILL`, `CMD_TMAN_CHANGE_ROLE`, `CMD_TMAN_RESPEC`,
   `CMD_TMAN_DROP_SKILLS`, `CMD_TMAN_MULTI_RESPEC`, `CMD_TMAN_RESTORE`,
