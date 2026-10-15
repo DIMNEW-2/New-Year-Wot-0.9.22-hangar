@@ -3,6 +3,7 @@
 Usage::
 
     python3 -m server --client /path/to/World_of_Tanks
+    python3 -m server verify --client /path/to/World_of_Tanks
     python3 -m server --catalog catalog.json --save server/data/account.json
     python3 -m server info --client /path/to/World_of_Tanks
 
@@ -64,7 +65,7 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="what the starting garage contains (default: %(default)s)")
     parser.add_argument("-v", "--verbose", action="count", default=0, help="-v info, -vv debug")
     parser.add_argument("command", nargs="?", default="serve",
-                        choices=("serve", "info", "extract", "inspect"),
+                        choices=("serve", "verify", "info", "extract", "inspect"),
                         help="what to do (default: serve)")
     return parser
 
@@ -192,6 +193,22 @@ def _load_account(args, catalog, source: str) -> AccountState:
     return state
 
 
+def _command_verify(args) -> int:
+    """``python3 -m server verify`` - check the installation and a session."""
+    from . import doctor
+
+    source = args.client or args.catalog or loader.guess_client()
+    if not source:
+        print("no World of Tanks installation found; pass --client <game folder>")
+        return 1
+    code = doctor.run(catalog=None, source=source)
+    if code == 0:
+        print("")
+        print("Start the server with:  python3 -m server serve --client %s" % source)
+        print("Then start the game (the mod logs in by itself, see client_mod/README.md).")
+    return code
+
+
 def _command_info(args) -> int:
     source = _resolve_source(args)
     catalog = _load_catalog(args, source)
@@ -265,6 +282,8 @@ def main(argv=None) -> int:
     _configure_logging(args.verbose)
     if args.command == "inspect":
         return _command_inspect(args)
+    if args.command == "verify":
+        return _command_verify(args)
     if args.command == "info":
         return _command_info(args)
     if args.command == "extract":

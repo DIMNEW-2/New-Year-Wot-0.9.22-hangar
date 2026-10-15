@@ -35,6 +35,19 @@ it prints the layout it found (or every place it looked) instead of a traceback.
 
 ## Quick start
 
+0. Ask the server to check the installation first — one command, a readable
+   report (game data, New Year definitions, crew lists, the New Year hangar
+   space in the client's packages, the mod, and a whole session over the real
+   wire protocol):
+
+   ```bash
+   python3 -m server verify --client /path/to/World_of_Tanks
+   ```
+
+   Everything the local server depends on shows up as `[ ok ]`; the two things
+   that come from the game itself (its packages and the mod) are warnings with
+   the exact command or path to fix them.
+
 1. Start the server (it listens on `127.0.0.1:28422` by default):
 
    ```bash

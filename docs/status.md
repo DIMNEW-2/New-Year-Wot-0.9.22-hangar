@@ -4,6 +4,20 @@ What works today, and what is still missing or unverified.
 
 ## Working (covered by `tests/`)
 
+* **Self check** — `python3 -m server verify --client <game folder>` reads the
+  installation (game data, New Year definitions, crew name lists), looks for the
+  New Year hangar space inside the client's packages and for the installed mod,
+  starts the server on a free port and then runs a whole session over the wire
+  (handshake, account diff, streamed price cache, opening a loot box, a garage
+  command, and an unsupported command that has to be refused).  It is the one
+  command a user runs before starting the game, and `tests/test_verify.py` keeps
+  it honest.
+* **Mirrored New Year tables** — the rules the client renders the event with
+  (craft prices, atmosphere levels, collection bonuses) are mirrored in
+  `server/game/ny_constants.py`; `tools/check_client_assets.py` evaluates the
+  client's own `common/items/new_year_types.py` (Python 2 literals, read with
+  `ast`) and compares every table, so a broken mirror is a test failure instead
+  of a number the player sees wrong.
 * **Game data** — the catalogue is read from the player's own `item_defs`
   (vehicles, modules with their prices, the New Year definitions) and validated
   (`python3 -m server info`).

@@ -38,6 +38,17 @@ other package in `gui/mods` keeps working.  If you prefer a compiled package,
 run `python3 tools/pack_wotmod.py` (needs Python 2.7 only for the compilation
 step) and install the resulting `mods/0.9.22.0.1/*.wotmod`.
 
+## Two conventions worth knowing
+
+* **`ext` payloads are pickles.**  ``Response.ext`` of the server is already
+  ``cPickle`` output (`Account.onCmdResponseExt` of the client does
+  ``ext = cPickle.loads(ext)`` itself), so ``wotny/account_proxy.py`` passes the
+  bytes through unchanged; only a plain object (an older server) is pickled
+  there.
+* **Streams are raw.**  ``Account.onStreamComplete`` hands the payload to the
+  ``SyncController``, which does the ``zlib`` + ``cPickle`` itself, so the
+  ``data`` of a ``stream`` frame is forwarded as it arrived.
+
 ## Settings (environment variables)
 
 | variable | default | meaning |

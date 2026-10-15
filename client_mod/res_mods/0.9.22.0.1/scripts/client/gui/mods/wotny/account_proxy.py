@@ -162,11 +162,17 @@ class AccountBridge(object):
         error = message.get('error') or ''
         ext = message.get('ext')
         try:
-            if ext is not None:
-                account.onCmdResponseExt(request_id, code, error,
-                                         cPickle.dumps(ext, 2))
-            else:
+            if ext is None:
                 account.onCmdResponse(request_id, code, error)
+            else:
+                # ``Account.onCmdResponseExt`` (``client/Account.py``) does
+                # ``ext = cPickle.loads(ext)`` itself, so the payload the server
+                # sends is already a pickle and has to be passed through
+                # unchanged.  Anything else (a plain object, e.g. from an older
+                # server) is pickled here.
+                if not isinstance(ext, str):
+                    ext = cPickle.dumps(ext, 2)
+                account.onCmdResponseExt(request_id, code, error, ext)
         except Exception:
             log.exception('cannot deliver the answer of request %s', request_id)
             return
