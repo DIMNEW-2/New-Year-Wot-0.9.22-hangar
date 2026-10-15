@@ -21,6 +21,7 @@ import sys
 
 from . import loader
 from .account_rpc.server import DEFAULT_HOST, DEFAULT_PORT, AccountServer
+from .game.defs import DefsError
 from .account_rpc.state import AccountState
 
 DEFAULT_SAVE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "account.json")
@@ -62,7 +63,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--garage", default="researchable", choices=("researchable", "premium", "all"),
                         help="what the starting garage contains (default: %(default)s)")
     parser.add_argument("-v", "--verbose", action="count", default=0, help="-v info, -vv debug")
-    parser.add_argument("command", nargs="?", default="serve", choices=("serve", "info", "extract"),
+    parser.add_argument("command", nargs="?", default="serve",
+                        choices=("serve", "info", "extract", "inspect"),
                         help="what to do (default: serve)")
     return parser
 
@@ -84,7 +86,19 @@ def _resolve_source(args) -> str:
 
 def _load_catalog(args, source: str):
     logging.info("reading game data from %s", loader.source_description(source))
-    catalog = loader.load_catalog(source)
+    try:
+        catalog = loader.load_catalog(source)
+    except loader.ClientNotFound as error:
+        # A wrong or unsupported installation: explain the layout instead of
+        # letting a traceback be the answer.
+        raise SystemExit(
+            "%s\n\n%s\n\nPass --client with the folder that holds WorldOfTanks.exe "
+            "(or --catalog for a catalog.json export).\n%s"
+            % (error, loader.describe_installation(source),
+               _installation_hint(source))
+        )
+    except DefsError as error:
+        raise SystemExit("cannot read the game data of %s: %s" % (source, error))
     catalog.validate()
     logging.info(
         "catalogue: %d vehicles, %d decorations, %d boxes, %d chests",
@@ -92,6 +106,14 @@ def _load_catalog(args, source: str):
         len(catalog.new_year.boxes), len(catalog.new_year.chests),
     )
     return catalog
+
+
+def _installation_hint(source: str) -> str:
+    """A short note about what the looked-for folders are called."""
+    return ("Typical layouts:\n"
+            "  <game>\\res\\scripts.pkg          (the release build, packed)\n"
+            "  <game>\\res\\scripts\\item_defs   (an unpacked build)\n"
+            "  <game>\\WorldOfTanks.exe")
 
 
 def _build_account(args, catalog, source: str) -> AccountState:
@@ -186,6 +208,22 @@ def _command_info(args) -> int:
     return 0
 
 
+def _command_inspect(args) -> int:
+    """Show what the server sees when it is pointed at an installation."""
+    target = args.client or args.catalog or loader.guess_client() or os.getcwd()
+    print(loader.describe_installation(target))
+    try:
+        catalog = loader.load_catalog(target)
+        catalog.validate()
+    except Exception as error:
+        print("catalogue       : unavailable (%s)" % error)
+        return 1
+    print("catalogue       : %d vehicles, %d decorations, %d boxes, %d chests"
+          % (len(catalog.vehicles.all()), len(catalog.new_year.toys),
+             len(catalog.new_year.boxes), len(catalog.new_year.chests)))
+    return 0
+
+
 def _command_extract(args) -> int:
     from tools import extract_client_catalog
 
@@ -222,6 +260,8 @@ def _command_serve(args) -> int:
 def main(argv=None) -> int:
     args = _build_parser().parse_args(argv)
     _configure_logging(args.verbose)
+    if args.command == "inspect":
+        return _command_inspect(args)
     if args.command == "info":
         return _command_info(args)
     if args.command == "extract":

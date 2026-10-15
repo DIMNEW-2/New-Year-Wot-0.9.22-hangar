@@ -684,9 +684,14 @@ def _top_component(components: Sequence[Component], group_name: str, fallback: O
 
 
 class VehicleCatalog:
-    def __init__(self, vehicles: Dict[int, VehicleType]):
+    def __init__(self, vehicles: Dict[int, VehicleType], extra_prices: Dict[int, Tuple[int, int]] = None):
         self.vehicles = dict(vehicles)
         self.by_name: Dict[str, VehicleType] = {vehicle.name: vehicle for vehicle in self.vehicles.values()}
+        #: ``compactDescr -> (credits, gold)`` of the items that do not belong to
+        #: a vehicle: shells (one table per nation), equipment and optional
+        #: devices (both ``nations.NONE_INDEX``).  The shop sends these prices
+        #: with its cache, and the depot/buy dialogs read them from there.
+        self.extra_prices: Dict[int, Tuple[int, int]] = dict(extra_prices or {})
 
     def get(self, compact_descr: int) -> Optional[VehicleType]:
         return self.vehicles.get(compact_descr)
@@ -713,8 +718,31 @@ class VehicleCatalog:
             result.append(vehicle)
         return sorted(result, key=lambda vehicle: (vehicle.nation_id, vehicle.innation_id))
 
+    def item_prices(self) -> Dict[int, Tuple[int, int]]:
+        """``compactDescr -> (credits, gold)`` of every priced item."""
+        prices: Dict[int, Tuple[int, int]] = {}
+        from .items import make_int_compact_descr_by_id
+
+        for vehicle in self.all():
+            prices[vehicle.compact_descr] = (max(0, int(vehicle.price_credits)),
+                                            max(0, int(vehicle.price_gold)))
+            modules = list(vehicle.groups.get("chassis", ())) + list(vehicle.groups.get("engine", ()))
+            modules += list(vehicle.groups.get("radio", ())) + list(vehicle.groups.get("fuelTank", ()))
+            for turret_group in vehicle.turrets:
+                modules.append(turret_group.turret)
+                modules.extend(turret_group.guns)
+            for component in modules:
+                prices[component.compact_descr] = (max(0, int(component.price_credits)),
+                                                  max(0, int(component.price_gold)))
+        prices.update(self.extra_prices)
+        return prices
+
     def to_json(self) -> dict:
-        return {"vehicles": [vehicle.as_json() for vehicle in self.all()]}
+        return {
+            "vehicles": [vehicle.as_json() for vehicle in self.all()],
+            "extraPrices": [[compact, price[0], price[1]]
+                            for compact, price in sorted(self.extra_prices.items())],
+        }
 
     @classmethod
     def from_json(cls, payload: dict) -> "VehicleCatalog":
@@ -722,7 +750,9 @@ class VehicleCatalog:
         for raw in payload["vehicles"]:
             vehicle = VehicleType.from_json(raw)
             vehicles[vehicle.compact_descr] = vehicle
-        return cls(vehicles)
+        extra = {int(compact): (int(credits), int(gold))
+                 for compact, credits, gold in payload.get("extraPrices", ())}
+        return cls(vehicles, extra)
 
 
 # --------------------------------------------------------------------------
@@ -879,6 +909,53 @@ def _int_from_text(text: str) -> int:
         return -1
 
 
+#: The files that price the items which are not part of a vehicle.  Shells are
+#: stored per nation, equipment and optional devices once for all nations
+#: (``nations.NONE_INDEX``), exactly as ``common/items`` numbers them.
+EXTRA_PRICE_FILES = (
+    ("vehicles/common/equipments.xml", "equipment", "common"),
+    ("vehicles/common/optional_devices.xml", "optionalDevice", "common"),
+)
+
+
+def _parse_extra_prices(source: DefsSource, nations: Sequence[str]) -> Dict[int, Tuple[int, int]]:
+    """``compactDescr -> (credits, gold)`` of shells, equipment and devices.
+
+    The three files write their prices as ``<price>`` with an optional currency
+    child (``<price>\t3000\t</price>``, ``<price>\t50\t<gold></gold></price>``),
+    which is the same shape the vehicles use.
+    """
+    from .items import make_int_compact_descr_by_id
+
+    prices: Dict[int, Tuple[int, int]] = {}
+
+    def read(path: str, item_type: str, nation_id: int) -> None:
+        if not source.has(path):
+            return
+        section = source.read_section(path)
+        for entry in section.subsections():
+            item_id = entry.value_int("id", -1)
+            if item_id < 0:
+                continue
+            price, currency = _read_price(entry)
+            if price <= 0:
+                continue
+            credits = price if currency == "credits" else 0
+            gold = price if currency == "gold" else 0
+            try:
+                compact = make_int_compact_descr_by_id(item_type, nation_id, item_id)
+            except ValueError:
+                continue
+            prices[compact] = (credits, gold)
+
+    for nation in nations:
+        read("vehicles/%s/components/shells.xml" % nation, "shell", nyc.NATION_INDICES[nation])
+    for path, item_type, _scope in EXTRA_PRICE_FILES:
+        # ``nations.NONE_INDEX`` is 15: the item does not belong to a nation.
+        read(path, item_type, 15)
+    return prices
+
+
 def load_vehicle_catalog(source: DefsSource, nations: Sequence[str] = nyc.NATIONS) -> VehicleCatalog:
     vehicles: Dict[int, VehicleType] = {}
     for nation in nations:
@@ -890,7 +967,10 @@ def load_vehicle_catalog(source: DefsSource, nations: Sequence[str] = nyc.NATION
                 continue
             components[group_name] = _parse_component_file(source.read_section(path), group_name, nation_id)
 
-        list_section = source.read_section("vehicles/%s/list.xml" % nation)
+        list_path = "vehicles/%s/list.xml" % nation
+        if not source.has(list_path):
+            continue
+        list_section = source.read_section(list_path)
         for entry in list_section.subsections():
             vehicle_name = entry.name
             innation_id = entry.value_int("id", -1)
@@ -914,7 +994,7 @@ def load_vehicle_catalog(source: DefsSource, nations: Sequence[str] = nyc.NATION
             if vehicle_path is not None:
                 _apply_vehicle_xml(vehicle, source.read_section(vehicle_path), components)
             vehicles[vehicle.compact_descr] = vehicle
-    return VehicleCatalog(vehicles)
+    return VehicleCatalog(vehicles, _parse_extra_prices(source, nations))
 
 
 _VEHICLE_FILE_INDEX: Dict[str, Dict[str, str]] = {}
