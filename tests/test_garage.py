@@ -564,6 +564,136 @@ def test_garage_survives_a_restart(runner: common.Runner) -> None:
         server.stop()
 
 
+# ---------------------------------------------------------------------------
+# the invariants the client's own validator checks
+# ---------------------------------------------------------------------------
+def _client_split_devices(data: bytes, turret_positions: int):
+    """``_splitVehicleCompactDescr`` + ``VehicleDescr.__init__`` of the client.
+
+    The flags byte counts the slots from the *last* one upwards and the device
+    ids follow packed from the last occupied slot backwards, so this is the only
+    reading that decides which slot a mounted device ends up in.
+    """
+    import struct
+
+    index = 10 + turret_positions * 4
+    flags = data[index]
+    index += 1
+    occupied = [bit for bit in range(3) if flags & 1 << bit]
+    devices = data[index:index + len(occupied) * 2]
+    result = [None, None, None]
+    position = 2
+    bits = flags & 7
+    while bits:
+        if bits & 1:
+            result[position] = struct.unpack("<H", devices[:2])[0]
+            devices = devices[2:]
+        bits >>= 1
+        position -= 1
+    return result
+
+
+def test_optional_device_slots_match_the_client(runner: common.Runner) -> None:
+    """A device mounted in slot *i* is read back from slot *i* by the client."""
+    state, server, bridge = _socket_pair(runner)
+    try:
+        entry = min(state.vehicles.values(), key=lambda item: item.inv_id)
+        vehicle = state.catalog.vehicles.get(entry.compact_descr)
+        compact, device_id = _device(state, removable=True, vehicle_type=vehicle)
+        _buy(bridge, state, compact, 1)
+        revision = state.shop_payload()["rev"]
+        for slot in range(3):
+            response, diffs, actions = bridge.command(
+                _next_request(), cmd.CMD_EQUIP_OPTDEV,
+                ([revision, entry.inv_id, compact, slot, 0],))
+            runner.equal(response["code"], cmd.RES_SUCCESS,
+                         "the device is mounted in slot %d" % slot)
+            data = entry.in_battle_descr(vehicle)
+            devices = _client_split_devices(data, len(vehicle.turrets_by_position()))
+            runner.equal(devices[slot], device_id,
+                         "the client reads the device from slot %d" % slot)
+            # take it off again (it is the only one in the depot)
+            response, diffs, actions = bridge.command(
+                _next_request(), cmd.CMD_EQUIP_OPTDEV,
+                ([revision, entry.inv_id, 0, slot, 0],))
+            runner.equal(response["code"], cmd.RES_SUCCESS,
+                         "the device comes off slot %d again" % slot)
+        bridge.close()
+    finally:
+        server.stop()
+
+
+def test_every_vehicle_descriptor_round_trips(runner: common.Runner) -> None:
+    """The descriptor of every vehicle of the garage can be read back."""
+    from server.game import vehicle_descr as descr_module
+
+    state = common.new_account(runner.client)
+    failures = []
+    for entry in state.vehicles.values():
+        vehicle = state.catalog.vehicles.get(entry.compact_descr)
+        if vehicle is None:
+            failures.append("vehicle %s has no catalogue entry" % entry.compact_descr)
+            continue
+        try:
+            parsed = descr_module.parse_compact_descr(
+                entry.in_battle_descr(vehicle), len(vehicle.turrets_by_position()))
+        except Exception as error:  # noqa: BLE001 - the message is the report
+            failures.append("%s: %s" % (vehicle.name, error))
+            continue
+        if parsed["nationID"] != vehicle.nation_id or parsed["vehicleTypeID"] != vehicle.innation_id:
+            failures.append("%s: header mismatch" % vehicle.name)
+        positions = sorted(vehicle.turrets_by_position())
+        if [tuple(pair) for pair in parsed["turrets"]] != [tuple(pair) for pair in entry.turrets]:
+            failures.append("%s: turrets %r != %r" % (vehicle.name, parsed["turrets"],
+                                                      entry.turrets))
+        if len(parsed["turrets"]) != len(positions):
+            failures.append("%s: %d turret positions" % (vehicle.name, len(parsed["turrets"])))
+    runner.check(not failures, "every descriptor round trips (%d problems: %s)"
+                 % (len(failures), "; ".join(failures[:5])))
+
+
+def test_the_client_validator_accepts_the_garage(runner: common.Runner) -> None:
+    """The invariants ``AccountValidator`` raises on hold for the whole account."""
+    state = common.new_account(runner.client)
+    problems = []
+    for entry in state.vehicles.values():
+        vehicle = state.catalog.vehicles.get(entry.compact_descr)
+        if vehicle is None:
+            problems.append("unknown vehicle %s" % entry.compact_descr)
+            continue
+        crew = [value for value in entry.crew if value is not None]
+        if len(crew) > len(vehicle.crew_roles):
+            problems.append("%s carries %d crew for %d roles"
+                            % (vehicle.name, len(crew), len(vehicle.crew_roles)))
+        for index, device in enumerate(entry.devices or ()):
+            if device is None:
+                continue
+            if not device and device != 0:
+                continue
+            compact = items_module.make_int_compact_descr_by_id("optionalDevice",
+                                                                vehicle.nation_id, device)
+            if compact not in state.catalog.devices:
+                problems.append("%s has device %s that the catalogue does not know"
+                                % (vehicle.name, device))
+        # The grid of the descriptor is exactly the client's own layout.
+        positions = len(vehicle.turrets_by_position())
+        expected = 10 + positions * 4 + 1
+        expected += 2 * len([value for value in (entry.devices or ()) if value is not None])
+        if len(entry.in_battle_descr(vehicle)) != expected:
+            problems.append("%s has a %d byte descriptor, expected %d"
+                            % (vehicle.name, len(entry.in_battle_descr(vehicle)), expected))
+    for item_type, items in state.items.items():
+        for compact in items:
+            if state.price_of(compact) is None:
+                problems.append("depot item %s (type %s) is unknown to the shop"
+                                % (compact, item_type))
+    for compact in state.elite_vehicles:
+        if state.catalog.vehicles.get(compact) is None:
+            problems.append("elite vehicle %s is not in the catalogue" % compact)
+    runner.check(not problems, "the account would pass AccountValidator "
+                               "(%d problems: %s)" % (len(problems), "; ".join(problems[:5])))
+
+
 def main(argv=None) -> int:
     return common.main(sys.modules[__name__], argv=argv)
 

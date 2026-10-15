@@ -74,7 +74,7 @@ def make_compact_descr(
         payload += struct.pack("<2H", turret_id, gun_id)
 
     flags = 0
-    devices = b""
+    devices: List[bytes] = []
     for index, device_id in enumerate(optional_devices or ()):
         # An empty slot is ``None`` (or a plain ``0`` for callers that build the
         # list from XML ids): the *flags* byte is what marks a mounted device,
@@ -82,9 +82,13 @@ def make_compact_descr(
         # not be confused.
         if index >= OPTIONAL_DEVICE_SLOTS or device_id is None or device_id == "":
             continue
-        flags |= 1 << index
-        devices += struct.pack("<H", int(device_id))
-    payload += struct.pack("<B", flags) + devices
+        # ``VehicleDescr.makeCompactDescr`` of the client walks the three slots
+        # from the *first* one while shifting the mask left, so slot 0 ends up in
+        # the highest bit and the devices of the payload are packed from the last
+        # slot backwards (``devices = pack(device) + devices``).
+        flags |= 1 << (OPTIONAL_DEVICE_SLOTS - 1 - index)
+        devices.insert(0, struct.pack("<H", int(device_id)))
+    payload += struct.pack("<B", flags) + b"".join(devices)
     return payload
 
 
@@ -96,8 +100,19 @@ def stock_compact_descr(vehicle: VehicleType) -> bytes:
     return make_compact_descr(vehicle, configuration)
 
 
-def parse_compact_descr(data: bytes) -> Dict[str, object]:
-    """The inverse of :func:`make_compact_descr` (turrets/flags included)."""
+def parse_compact_descr(data: bytes, turret_positions: int = None) -> Dict[str, object]:
+    """The inverse of :func:`make_compact_descr` (turrets, flags, devices).
+
+    The optional-device part follows the client's own
+    ``_splitVehicleCompactDescr``/``VehicleDescr.__init__`` pair: the flags byte
+    holds the slots from the last one upwards and the device ids follow, packed
+    from the last occupied slot backwards.
+
+    ``turret_positions`` is the number of turret positions of the vehicle type
+    (the client takes it from its own catalogue: ``idx = 10 + len(type.turrets)
+    * 4``).  Without it a descriptor that carries optional devices cannot be
+    split unambiguously, so the devices are then expected to be absent.
+    """
     if len(data) < 11:
         raise VehicleDescrError("descriptor is too short: %d bytes" % len(data))
     header, vehicle_type_id = struct.unpack("<2B", data[:2])
@@ -114,11 +129,32 @@ def parse_compact_descr(data: bytes) -> Dict[str, object]:
         "fuelTank": fuel_tank,
         "radio": radio,
     }
-    count = max(0, (len(data) - 10) // 4)
+    if turret_positions is None:
+        count = max(0, (len(data) - 11) // 4)
+    else:
+        count = int(turret_positions)
+        if 10 + count * 4 >= len(data) + 1:
+            raise VehicleDescrError("descriptor ends inside its turret positions")
     turrets = []
     for index in range(count):
-        turrets.append(struct.unpack("<2H", data[10 + index * 4:12 + index * 4]))
+        turrets.append(struct.unpack("<2H", data[10 + index * 4:14 + index * 4]))
     result["turrets"] = turrets
+
+    index = 10 + len(turrets) * 4
+    flags = 0
+    devices: List[Optional[int]] = [None] * OPTIONAL_DEVICE_SLOTS
+    if index < len(data):
+        flags = data[index]
+        index += 1
+        occupied = [slot for slot in range(OPTIONAL_DEVICE_SLOTS)
+                    if flags & 1 << (OPTIONAL_DEVICE_SLOTS - 1 - slot)]
+        for slot in reversed(occupied):
+            if index + 2 > len(data):
+                raise VehicleDescrError("descriptor ends inside the optional devices")
+            devices[slot] = struct.unpack("<H", data[index:index + 2])[0]
+            index += 2
+    result["flags"] = flags
+    result["optionalDevices"] = devices
     return result
 
 
