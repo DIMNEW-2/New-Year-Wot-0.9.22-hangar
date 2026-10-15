@@ -1,33 +1,37 @@
-"""``python3 -m server verify``: the checks a run of the game depends on.
+"""``python3 -m server verify`` - check everything a run of the game needs.
 
-The desktop side of this project can be checked without Windows: the game data
-of the player's own installation, the New Year definitions, the crew name
-lists, and - most importantly - a whole session over the real wire protocol,
-with the same frames the client mod sends.
+The doctor looks at the player's own installation, at the New Year data the
+event is built from, and then starts the local server and talks to it exactly
+like the client mod does.  Every line of its report says what was checked, and
+the hints say what to do when a check failed:
 
-Two things cannot be checked from here and are reported as *warnings* with an
-explanation instead of failures:
+* **the installation** - a layout the loader understands (packed ``scripts.pkg``
+  or an unpacked ``item_defs`` tree), the catalogue it yields, the crew name
+  lists, and whether the client ships the New Year hangar space
+  (``spaces/h07_newyear_2015/space.settings``, looked for inside the packages),
+* **the mod** - ``res_mods/0.9.22.0.1/scripts/client/gui/mods/mod_wotny_local.py``
+  in the game folder; without it the client never talks to the local server,
+* **the session** - handshake, account diff, streamed shop cache, opening a loot
+  box, a garage command, and an unsupported command that has to be refused.
 
-* the New Year hangar space (``spaces/h07_newyear_2015``) - it lives in the
-  client's own packages, so the installations's archives are searched for it,
-* the client mod - it has to be copied into ``res_mods`` of the installation.
-
-The report is what the user reads before starting the game, so every line says
-what was checked and what to do when it went wrong.
+The report is the interface: it never raises, so a broken installation produces
+a readable list of problems instead of a traceback.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import socket
 import sys
+import time
 import zipfile
 import zlib
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 from . import loader
 from .account_rpc import commands as cmd
-from .account_rpc.server import AccountServer
+from .account_rpc.server import PROTOCOL_VERSION, AccountServer
 from .account_rpc.state import AccountState
 from .game.defs import DefsError
 from .proto import pack_message, py2_loads, read_frame, unpack_message
@@ -36,33 +40,49 @@ OK = "ok"
 WARN = "warn"
 FAIL = "fail"
 
-#: The hangar space the New Year notification switches the client to
-#: (``server/game/events.py::NEW_YEAR_HANGAR_PATH``).
-HANGAR_SPACE = "spaces/h07_newyear_2015"
-
-#: Where the mod has to be for the client to load it, relative to the game
-#: folder (see ``client_mod/README.md``).
-MOD_PATH = os.path.join("res_mods", "0.9.22.0.1", "scripts", "client", "gui",
-                        "mods", "mod_wotny_local.py")
-
 _MARKS = {OK: "[ ok ]", WARN: "[warn]", FAIL: "[FAIL]"}
 
-#: Sections a full account diff has to carry (the caches of the lobby read
-#: every one of them: ``client/Account.py`` -> ``ItemsCache``, ``EventsCache``,
-#: ``SettingsCache``, ``Stats``, ``ClientNewYear``).
-DIFF_SECTIONS = ("inventory", "stats", "account", "economics", "tokens",
-                 "newYear", "goodies", "serverSettings", "eventsData")
+#: The hangar space the event switches the client to
+#: (``server/game/events.py::NEW_YEAR_HANGAR_PATH``); ``ClientHangarSpace``
+#: resolves it through ``ResMgr.openSection(path + '/space.settings')``, which
+#: searches the packages of the installation.
+HANGAR_SPACE = "spaces/h07_newyear_2015"
+
+#: Where the mod has to be for the client to load it (``client_mod/README.md``).
+MOD_RELATIVE_PATH = os.path.join("res_mods", "0.9.22.0.1", "scripts", "client",
+                                 "gui", "mods", "mod_wotny_local.py")
+
+#: Sections a full account diff has to carry: every lobby cache reads one of
+#: them at login (``ItemsCache``, ``Stats``, ``EventsCache``, ``SettingsCache``,
+#: ``ClientNewYear``).
+DIFF_SECTIONS = ("inventory", "stats", "account", "economics", "tokens", "newYear",
+                 "goodies", "serverSettings", "eventsData")
+
+#: How many packages are opened while looking for the hangar space (a release
+#: installation keeps its spaces in ``res/packages``).
+ARCHIVES_TO_SCAN = 64
+
+
+class Line(object):
+    """One check of the report."""
+
+    __slots__ = ("status", "title", "detail")
+
+    def __init__(self, status: str, title: str, detail: str = ""):
+        self.status = status
+        self.title = title
+        self.detail = detail or ""
 
 
 class Report(object):
-    """The lines of one check, and how many of them are bad news."""
+    """A titled list of checks with a renderer and a verdict."""
 
     def __init__(self, title: str = ""):
         self.title = title
-        self.lines: List[Tuple[str, str, str]] = []
+        self.lines: List[Line] = []
 
     def add(self, status: str, title: str, detail: str = "") -> None:
-        self.lines.append((status, title, detail))
+        self.lines.append(Line(status, title, detail))
 
     def ok(self, title: str, detail: str = "") -> None:
         self.add(OK, title, detail)
@@ -74,31 +94,33 @@ class Report(object):
         self.add(FAIL, title, detail)
 
     def count(self, status: str) -> int:
-        return len([line for line in self.lines if line[0] == status])
+        return len([line for line in self.lines if line.status == status])
 
     @property
-    def problems(self) -> int:
+    def failures(self) -> int:
         return self.count(FAIL)
 
     @property
     def warnings(self) -> int:
         return self.count(WARN)
 
+    def title_of(self, needle: str) -> bool:
+        return any(needle in line.title for line in self.lines)
+
     def render(self, stream=sys.stdout) -> None:
         if self.title:
             stream.write("%s\n" % self.title)
-        for status, title, detail in self.lines:
-            stream.write("  %s %s\n" % (_MARKS.get(status, status), title))
-            if detail:
-                for line in str(detail).splitlines():
-                    stream.write("         %s\n" % line)
+        for line in self.lines:
+            stream.write("  %s %s\n" % (_MARKS[line.status], line.title))
+            for extra in str(line.detail).splitlines():
+                stream.write("         %s\n" % extra)
 
 
 # ---------------------------------------------------------------------------
-# The installation
+# the installation
 # ---------------------------------------------------------------------------
-def _archives_to_search(client_root: str, limit: int = 64) -> List[str]:
-    """The client's packages - the ones that can hold a space first."""
+def _packages_to_search(client_root: str) -> List[str]:
+    """The archives of an installation, the ones that hold spaces first."""
     folders = [os.path.join(client_root, "res", "packages"),
                os.path.join(client_root, "res"),
                client_root]
@@ -108,29 +130,25 @@ def _archives_to_search(client_root: str, limit: int = 64) -> List[str]:
             continue
         for name in sorted(os.listdir(folder)):
             path = os.path.join(folder, name)
-            if not os.path.isfile(path):
-                continue
-            if os.path.splitext(name)[1].lower() not in (".pkg", ".zip"):
-                continue
-            if path not in found:
+            if os.path.isfile(path) and os.path.splitext(name)[1].lower() == ".pkg":
                 found.append(path)
         if found:
             break
 
     def rank(path: str):
         lowered = os.path.basename(path).lower()
-        interesting = ("space" in lowered or "hangar" in lowered or "newyear" in lowered
-                       or "res" == lowered)
+        interesting = any(word in lowered for word in ("space", "hangar", "newyear",
+                                                       "new_year"))
         return (0 if interesting else 1, lowered)
 
-    return sorted(found, key=rank)[:limit]
+    return sorted(found, key=rank)[:ARCHIVES_TO_SCAN]
 
 
-def find_hangar_space(client_root: str) -> Tuple[bool, str]:
-    """Does this installation ship ``spaces/h07_newyear_2015``?"""
-    wanted = HANGAR_SPACE.lower()
-    name = os.path.basename(HANGAR_SPACE).lower()
-    archives = _archives_to_search(client_root)
+def find_hangar_space(client_root: str, space: str = HANGAR_SPACE) -> Tuple[bool, str]:
+    """Look for ``spaces/<name>/space.settings`` inside the packages."""
+    wanted = (space + "/space.settings").lower().lstrip("/")
+    name = os.path.basename(space).lower()
+    archives = _packages_to_search(client_root)
     for path in archives:
         if name in os.path.basename(path).lower():
             return True, "the package %s is named after it" % os.path.basename(path)
@@ -138,142 +156,152 @@ def find_hangar_space(client_root: str) -> Tuple[bool, str]:
             with zipfile.ZipFile(path) as archive:
                 for info in archive.infolist():
                     member = info.filename.replace("\\", "/").lower().lstrip("/")
-                    if member.startswith(wanted + "/") or member == wanted:
+                    if member.endswith(wanted):
                         return True, "%s is in %s" % (info.filename.strip("/"),
                                                       os.path.basename(path))
         except (zipfile.BadZipFile, OSError, RuntimeError):
             continue
-    return False, "searched %d archive(s) of the installation" % len(archives)
+    if not archives:
+        return False, "the installation has no res/packages to look in"
+    return False, "searched %d package(s)" % len(archives)
 
 
-def check_installation(root: str) -> Report:
-    """Everything the game needs from the installation."""
+def check_installation(client_root: str, catalog=None, tankmen_configs=None) -> Report:
+    """Everything the installation has to give the server."""
     report = Report("The installation")
     try:
-        layout = loader.find_client(root)
+        layout = loader.find_client(client_root)
     except loader.ClientNotFound as error:
         report.fail("the installation is unreadable",
-                    "%s\n%s" % (error, loader.describe_installation(root)))
+                    "%s\n%s" % (error, loader.describe_installation(client_root)))
         return report
-    report.ok("game data found", loader.source_description(root))
+    report.ok("the game data was found", loader.source_description(client_root))
 
-    catalog = None
-    try:
-        catalog = loader.load_catalog(root)
-        catalog.validate()
-    except (DefsError, ValueError) as error:
-        report.fail("the game data of the installation is incomplete", str(error))
+    if catalog is None:
+        try:
+            catalog = loader.load_catalog(client_root)
+            catalog.validate()
+        except (DefsError, ValueError) as error:
+            report.fail("the game data is incomplete", str(error))
+            catalog = None
     if catalog is not None:
         ny = catalog.new_year
-        detail = "%d vehicles, %d decorations, %d slots, %d boxes, %d chests" % (
-            len(catalog.vehicles.all()), len(ny.toys), len(ny.slots),
-            len(ny.boxes), len(ny.chests))
-        if not (ny.toys and ny.boxes and ny.chests and ny.collection_rewards):
-            report.fail("the New Year definitions are empty", detail)
+        detail = ("%d vehicles, %d decorations, %d slots, %d boxes, %d chests"
+                  % (len(catalog.vehicles.all()), len(ny.toys), len(ny.slots),
+                     len(ny.boxes), len(ny.chests)))
+        if ny.toys and ny.boxes and ny.chests and ny.collection_rewards:
+            report.ok("the New Year definitions are complete", detail)
         else:
-            report.ok("New Year definitions", detail)
+            report.fail("the New Year definitions are empty", detail)
 
-    try:
-        configs = loader.load_tankmen_configs(root)
-    except Exception as error:  # noqa: BLE001 - the data decides
-        configs = {}
-        report.warn("cannot read the crew name lists", str(error))
-    if configs:
-        report.ok("crew name lists", "%d nations" % len(configs))
+    if tankmen_configs is None:
+        try:
+            tankmen_configs = loader.load_tankmen_configs(client_root)
+        except Exception as error:  # noqa: BLE001 - the data decides
+            tankmen_configs = {}
+            report.warn("the crew name lists cannot be read", str(error))
+    if tankmen_configs:
+        report.ok("the crew name lists are there",
+                  "%d nations (crew members and the New Year tankwomen)"
+                  % len(tankmen_configs))
     else:
         report.warn("no crew name lists",
-                    "crew members and the New Year tankwoman would be missing;\n"
+                    "crew members and the New Year tankwomen would be missing;\n"
                     "the installation needs res/scripts or res/scripts.pkg")
 
-    installed, detail = find_hangar_space(layout.root)
-    if installed:
-        report.ok("the New Year hangar space (%s)" % HANGAR_SPACE, detail)
+    found, detail = find_hangar_space(layout.root)
+    if found:
+        report.ok("the New Year hangar space is in the packages", detail)
     else:
         report.warn("the New Year hangar space (%s) was not found" % HANGAR_SPACE,
                     "%s - the hangar would stay the stock one.\n"
-                    "Set WOTNY_NO_HANGAR=1 in the client environment to accept that, "
-                    "or point\nserver/game/events.py::NEW_YEAR_HANGAR_PATH at the space "
-                    "this build ships." % detail)
+                    "Point server/game/events.py::NEW_YEAR_HANGAR_PATH at the space "
+                    "this build\nships, or look at gui/hangars.xml in the client for "
+                    "the name it uses." % detail)
 
-    mod = os.path.join(layout.root, MOD_PATH)
-    repo_scripts = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "client_mod", "res_mods", "0.9.22.0.1", "scripts")
+    mod = os.path.join(layout.root, MOD_RELATIVE_PATH)
     if os.path.isfile(mod):
         report.ok("the client mod is installed", mod)
     else:
         report.warn("the client mod is not installed yet",
-                    "copy it into the game folder:\n"
-                    "  %s\n  ->  %s"
-                    % (repo_scripts, os.path.join(layout.root, "res_mods", "0.9.22.0.1",
-                                                  "scripts")))
+                    "without it the client never reaches the local server.  Copy:\n"
+                    "  %s\n"
+                    "into %s"
+                    % (_client_mod_path(), os.path.join(layout.root, "res_mods",
+                                                        "0.9.22.0.1", "scripts")))
     return report
 
 
+def _client_mod_path() -> str:
+    """``<repo>/client_mod/res_mods/0.9.22.0.1/scripts`` of this checkout."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(os.path.dirname(here), "client_mod", "res_mods", "0.9.22.0.1",
+                        "scripts")
+
+
 # ---------------------------------------------------------------------------
-# A whole session over the wire
+# the session the mod has
 # ---------------------------------------------------------------------------
-class _Session(object):
+class Client(object):
     """The smallest client there is: the framing of ``server.proto`` over TCP."""
 
-    def __init__(self, port: int, timeout: float = 30.0):
-        self.socket = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    def __init__(self, port: int, host: str = "127.0.0.1", timeout: float = 60.0):
+        self.socket = socket.create_connection((host, port), timeout=timeout)
         self.reader = self.socket.makefile("rb")
         self.writer = self.socket.makefile("wb")
-        self.pushed = []
-        self.streams = []
 
     def send(self, message) -> None:
         self.writer.write(pack_message(message))
         self.writer.flush()
 
-    def recv(self):
+    def recv(self) -> dict:
         return unpack_message(read_frame(self.reader))
 
-    def command(self, request_id: int, code: int, args: tuple = ()):
-        """Send one ``_doCmd*`` and collect ``(response, diffs, messages)``."""
-        self.send({"type": "cmd", "requestID": request_id, "code": code,
+    def hello(self, client: str = "verify") -> dict:
+        """``hello`` -> ``welcome``; anything else is a protocol error."""
+        self.send({"type": "hello", "protocol": PROTOCOL_VERSION, "client": client})
+        message = self.recv()
+        if message.get("type") != "welcome":
+            raise RuntimeError("the server did not answer the handshake: %r" % (message,))
+        return message
+
+    def command(self, request_id: int, opcode: int, args: Sequence = ()) -> Tuple[dict, List[dict], List[dict]]:
+        """Send one ``_doCmd*``; returns ``(response, diffs, sysMessages, streams)``."""
+        self.send({"type": "cmd", "requestID": request_id, "code": opcode,
                    "args": tuple(args)})
-        response, diffs, messages = None, [], []
+        response: dict = {}
+        diffs: List[dict] = []
+        messages: List[dict] = []
+        streams: List[dict] = []
         while True:
             message = self.recv()
             kind = message.get("type")
             if kind == "diff":
-                diffs.append(message["diff"])
+                diffs.append(message.get("diff") or {})
             elif kind == "sysMessage":
-                messages.append(message["action"])
+                messages.append(message.get("action") or {})
             elif kind == "stream":
-                self.streams.append(message)
+                streams.append(message)
             elif kind == "response":
                 response = message
-                break
+                return response, diffs, messages, streams
             else:
-                self.pushed.append(message)
-        return response, diffs, messages
-
-    def hello(self, client: str = "verify") -> dict:
-        from .account_rpc.server import PROTOCOL_VERSION
-
-        self.send({"type": "hello", "protocol": PROTOCOL_VERSION, "client": client})
-        welcome = self.recv()
-        if welcome.get("type") != "welcome":
-            raise RuntimeError("the server did not answer the handshake: %r" % (welcome,))
-        return welcome
+                raise RuntimeError("unexpected message %r" % (message,))
 
     def close(self) -> None:
         try:
             self.send({"type": "bye"})
         except OSError:
             pass
-        for stream in (self.writer, self.reader, self.socket):
+        for part in (self.writer, self.reader, self.socket):
             try:
-                stream.close()
+                part.close()
             except OSError:
                 pass
 
 
-def _sections_of(diff) -> set:
-    """The names of a diff's top level sections (``('eventsData','_r')`` -> name)."""
+def _sections(diff) -> set:
+    """The section names of a diff (``('eventsData', '_r')`` -> ``eventsData``)."""
     names = set()
     for key in diff or {}:
         if isinstance(key, tuple):
@@ -283,72 +311,68 @@ def _sections_of(diff) -> set:
     return names
 
 
-def _first_box(state) -> Optional[str]:
+def _first_box(state: AccountState) -> Optional[str]:
     for box, count in sorted(state.new_year.state.boxes.items()):
         if count:
             return box
     return None
 
 
-def _first_vehicle(state) -> int:
-    entries = sorted(state.vehicles.values(), key=lambda entry: entry.inv_id)
-    return entries[0].inv_id if entries else 0
-
-
-def check_session(catalog, tankmen_configs=None) -> Report:
-    """Start the server on a free port and talk to it like the client does."""
-    report = Report("A session over the wire")
+def check_session(catalog, tankmen_configs=None, stream=None) -> Report:
+    """Start the server on a free port and drive it like the client does."""
+    report = Report("A session with the local server")
     state = AccountState.new(catalog, tankmen_configs=tankmen_configs or {})
     try:
-        server = AccountServer(state, host="127.0.0.1", port=0, save_path=None).start()
+        server = AccountServer(state, host="127.0.0.1", port=0, save_path=None,
+                               log=logging.getLogger("server.verify")).start()
     except OSError as error:
-        report.fail("the local server cannot start", str(error))
+        report.fail("the local server does not start", str(error))
         return report
-    session = None
-    try:
-        session = _Session(server.port)
-        welcome = session.hello()
-        account = welcome.get("account") or {}
-        sections = _sections_of(welcome.get("diff") or {})
-        if account.get("name") and sections:
-            report.ok("the bridge handshake answers",
-                      "account %r, revision %s, %s"
-                      % (account.get("name"), (welcome.get("diff") or {}).get("rev"),
-                         ", ".join(sorted(sections))))
-        else:
-            report.fail("the handshake does not carry an account",
-                        "welcome: %r" % (welcome,))
 
-        response, diffs, _ = session.command(1, cmd.CMD_SYNC_DATA, (0, 0, 0, 0, 0))
-        # ``AccountSyncData.__onSyncResponse`` reads the diff from the ext of the
-        # answer (a pickle, unpacked by the bridge of the client), so that is
-        # where the snapshot has to be.
+    client = None
+    try:
+        client = Client(server.port)
+        welcome = client.hello()
+        account = welcome.get("account") or {}
+        diff = welcome.get("diff") or {}
+        if account.get("name") and _sections(diff):
+            report.ok("the handshake answers",
+                      "account %r, protocol %s, revision %s"
+                      % (account.get("name"), welcome.get("protocol"), diff.get("rev")))
+        else:
+            report.fail("the handshake carries no account", repr(welcome))
+
+        response, diffs, _, _ = client.command(1, cmd.CMD_SYNC_DATA, (0, 0, 0, 0, 0))
+        # ``AccountSyncData.__onSyncResponse`` reads the diff from the ``ext`` of
+        # the answer (the bridge unpacks the pickle for it), so that is where the
+        # snapshot has to be.
         ext = response.get("ext")
-        diff = py2_loads(ext) if isinstance(ext, bytes) else (diffs[-1] if diffs else {})
-        missing = [name for name in DIFF_SECTIONS if name not in _sections_of(diff)]
+        body = py2_loads(ext) if ext else (diffs[-1] if diffs else {})
+        missing = [name for name in DIFF_SECTIONS if name not in _sections(body)]
         if response.get("code") != cmd.RES_SUCCESS:
             report.fail("CMD_SYNC_DATA is not answered", repr(response))
         elif missing:
             report.fail("the account diff is incomplete",
                         "missing: %s" % ", ".join(missing))
         else:
-            report.ok("the account diff (CMD_SYNC_DATA)",
+            report.ok("the account diff is complete",
                       "%d sections, %d vehicles, %d crew members"
-                      % (len(_sections_of(diff)), len(state.vehicles), len(state.tankmen)))
+                      % (len(_sections(body)), len(state.vehicles), len(state.tankmen)))
 
-        response, _, _ = session.command(2, cmd.CMD_SYNC_SHOP, (0, 0, 0))
-        frame = session.recv()
+        response, _, _, streams = client.command(2, cmd.CMD_SYNC_SHOP, (0, 0, 0))
+        frame = streams[0] if streams else client.recv()
         if response.get("code") != cmd.RES_STREAM or frame.get("type") != "stream":
             report.fail("the price cache (CMD_SYNC_SHOP) is not streamed",
                         "answer %r, next frame %r" % (response, frame))
         else:
-            shop = py2_loads(zlib.decompress(frame["data"]))
-            prices = (shop.get("items") or {}).get("itemPrices") or {}
+            shop = py2_loads(zlib.decompress(frame.get("data")))
+            prices = ((shop.get("items") or {}).get("itemPrices")) or {}
             if len(prices) > 100 and "sellPriceFactor" in shop:
-                report.ok("the price cache (CMD_SYNC_SHOP)",
-                          "%d prices, sell factor %s, exchange rate %s"
-                          % (len(prices), shop.get("sellPriceFactor"),
-                             shop.get("exchangeRate")))
+                report.ok("the price cache is streamed",
+                          "%d prices, sell factor %s, exchange rate %s, premium from "
+                          "%d gold" % (len(prices), shop.get("sellPriceFactor"),
+                                       shop.get("exchangeRate"),
+                                       min((shop.get("premiumCost") or {0: 0}).values())))
             else:
                 report.fail("the price cache is empty", "%d prices" % len(prices))
 
@@ -356,94 +380,116 @@ def check_session(catalog, tankmen_configs=None) -> Report:
         if box is None:
             report.warn("no loot box to open", "the event state holds no boxes")
         else:
-            response, diffs, messages = session.command(3, cmd.CMD_NEW_YEAR_OPEN_BOX, (box,))
+            response, diffs, messages, _ = client.command(
+                3, cmd.CMD_NEW_YEAR_OPEN_BOX, (box,))
             payload = (messages[0].get("data") or {}) if messages else {}
-            prizes = payload.get("data") or {}
+            bonus = payload.get("data") or {}
             if response.get("code") != cmd.RES_SUCCESS:
-                report.fail("opening a loot box is not answered", repr(response))
+                report.fail("a loot box is not opened", repr(response))
             elif payload.get("type") != cmd.SYS_MESSAGE_TYPE_TOKEN_QUESTS:
-                report.fail("opening a loot box does not report its prizes",
-                            "sys message: %r" % (payload,))
+                report.fail("the loot box reports no prizes",
+                            "system message: %r" % (payload,))
             else:
-                report.ok("opening a loot box (%s)" % box,
-                          "prize sections: %s" % ", ".join(sorted(prizes or ())))
-                if "ny18Toys" in prizes:
-                    report.ok("the loot box carries decorations",
-                              "%d toy(s) per the client's own reward window"
-                              % len(prizes.get("ny18Toys") or ()))
+                report.ok("a loot box opens and reports its prizes",
+                          "%s: %s" % (box, ", ".join(sorted(bonus))))
+                if bonus.get("ny18Toys"):
+                    report.ok("the loot box hands out decorations",
+                              "%d decoration(s)" % len(bonus["ny18Toys"]))
+                if not diffs:
+                    report.fail("opening a loot box does not update the account",
+                                "no diff was pushed")
+                else:
+                    report.ok("the loot box updates the account",
+                              "%d diff(s), %s"
+                              % (len(diffs), ", ".join(sorted(_sections(diffs[-1])))))
 
-        response, _, _ = session.command(4, cmd.CMD_REPAIR, (_first_vehicle(state), 0, 0))
-        if response.get("code") != cmd.RES_SUCCESS:
-            report.warn("a garage command (CMD_REPAIR) is not answered", repr(response))
-        else:
-            report.ok("a garage command (CMD_REPAIR) is answered", "")
-
-        response, _, _ = session.command(5, 99999, (0, 0, 0))
+        entries = sorted(state.vehicles.values(), key=lambda entry: entry.inv_id)
+        vehicle = entries[0].inv_id if entries else 0
+        response, _, _, _ = client.command(4, cmd.CMD_REPAIR, (vehicle, 0, 0))
         if response.get("code") == cmd.RES_SUCCESS:
-            report.warn("an unknown command is answered with success",
+            report.ok("a garage command is answered", "CMD_REPAIR on vehicle %s" % vehicle)
+        else:
+            report.warn("a garage command is not answered", repr(response))
+
+        response, _, _, _ = client.command(5, cmd.CMD_SYNC_DATA, (0, 0, 0, 0, 0))
+        if response.get("code") == cmd.RES_SUCCESS:
+            report.ok("a second sync is answered", "revision %s" % state.revision)
+        else:
+            report.fail("a second sync is not answered", repr(response))
+
+        response, _, _, _ = client.command(6, 99999, (0, 0, 0))
+        if response.get("code") == cmd.RES_SUCCESS:
+            report.warn("an unsupported command is answered with success",
                         "the client would believe it did something")
         else:
-            report.ok("an unknown command is refused",
+            report.ok("an unsupported command is refused, not faked",
                       "the client shows %r" % (response.get("error"),))
-    except OSError as error:
+    except (OSError, RuntimeError) as error:
         report.fail("the session with the local server failed", str(error))
-    except Exception as error:  # noqa: BLE001 - the report is the interface
-        report.fail("the session with the local server failed",
-                    "%s: %s" % (type(error).__name__, error))
     finally:
-        if session is not None:
-            session.close()
+        if client is not None:
+            client.close()
         server.stop()
     return report
 
 
 # ---------------------------------------------------------------------------
-# The command
+# the command
 # ---------------------------------------------------------------------------
 def run(client: Optional[str] = None, catalog=None, source: Optional[str] = None,
-        stream=sys.stdout, session: bool = True, tankmen_configs=None) -> int:
-    """Check an installation and a session; returns a process exit code."""
+        stream=sys.stdout, session: bool = True, tankmen_configs=None,
+        garage_mode: str = "researchable") -> int:
+    """Check an installation (when given) and a session; the process exit code."""
     root = source or client
     if root:
-        installation = check_installation(root)
+        installation = check_installation(root, catalog=catalog,
+                                          tankmen_configs=tankmen_configs)
     else:
-        installation = Report("No installation given")
-        installation.warn("nothing was checked against an installation",
-                          "pass --client <game folder> to check one")
+        installation = Report("The installation")
+        installation.warn("no installation was given",
+                          "pass --client <game folder> to also check the game data")
+
     if catalog is None and root:
         try:
             catalog = loader.load_catalog(root)
-        except Exception as error:  # noqa: BLE001 - reported above
-            if installation.problems == 0:
-                installation.fail("cannot read the game data", str(error))
+        except Exception as error:  # noqa: BLE001 - reported by check_installation
+            if not installation.failures:
+                installation.fail("the game data cannot be read", str(error))
 
-    sessions = None
-    if session and catalog is not None:
-        if tankmen_configs is None and root:
-            try:
-                tankmen_configs = loader.load_tankmen_configs(root)
-            except Exception:  # noqa: BLE001 - reported by check_installation
-                tankmen_configs = {}
-        sessions = check_session(catalog, tankmen_configs=tankmen_configs)
+    session_report = None
+    if session:
+        if catalog is None:
+            session_report = Report("A session with the local server")
+            session_report.warn("the session was skipped",
+                                "there is no catalogue to build an account from")
+        else:
+            if tankmen_configs is None and root:
+                try:
+                    tankmen_configs = loader.load_tankmen_configs(root)
+                except Exception:  # noqa: BLE001 - reported by the installation check
+                    tankmen_configs = {}
+            session_report = check_session(catalog, tankmen_configs=tankmen_configs,
+                                           stream=stream)
 
     installation.render(stream)
-    problems, warnings = installation.problems, installation.warnings
-    if sessions is not None:
+    failures, warnings = installation.failures, installation.warnings
+    if session_report is not None:
         stream.write("\n")
-        sessions.render(stream)
-        problems += sessions.problems
-        warnings += sessions.warnings
+        session_report.render(stream)
+        failures += session_report.failures
+        warnings += session_report.warnings
     stream.write("\n")
-    if problems:
-        stream.write("verify: %d problem(s), %d warning(s) - the game would not work yet\n"
-                     % (problems, warnings))
+    if failures:
+        stream.write("verify: %d problem(s) and %d warning(s) - the game would not "
+                     "work yet\n" % (failures, warnings))
         return 1
     if warnings:
-        stream.write("verify: everything the local server needs is in place "
-                     "(%d warning(s) to read)\n" % warnings)
+        stream.write("verify: the local server is ready (%d warning(s) to read)\n"
+                     % warnings)
     else:
-        stream.write("verify: everything the local server needs is in place\n")
+        stream.write("verify: the local server is ready\n")
     return 0
 
 
-__all__ = ["Report", "check_installation", "check_session", "find_hangar_space", "run"]
+__all__ = ["Client", "Line", "Report", "check_installation", "check_session",
+           "find_hangar_space", "run"]

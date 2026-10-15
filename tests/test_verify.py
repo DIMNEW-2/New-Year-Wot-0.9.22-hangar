@@ -40,11 +40,12 @@ def test_the_doctor_is_green(runner: common.Runner) -> None:
     """Every check the local server depends on passes."""
     code, report = _report(runner.client)
     runner.equal(code, 0, "the doctor is green:\n%s" % report)
-    runner.check("everything the local server needs is in place" in report,
-                 "and says so")
-    for title in ("game data found", "New Year definitions", "crew name lists",
-                  "the bridge handshake answers", "the account diff (CMD_SYNC_DATA)",
-                  "the price cache (CMD_SYNC_SHOP)", "opening a loot box"):
+    runner.check("verify: the local server is ready" in report, "and says so")
+    for title in ("the game data was found", "the New Year definitions are complete",
+                  "the crew name lists are there", "the handshake answers",
+                  "the account diff is complete", "the price cache is streamed",
+                  "a loot box opens", "a garage command is answered",
+                  "an unsupported command is refused"):
         runner.check(any(title in line for line in _titles(report)),
                      "the report has a line about %r" % title)
 
@@ -53,18 +54,22 @@ def test_the_doctor_checks_the_wire(runner: common.Runner) -> None:
     """The session part really talks to a started server."""
     code, report = _report(runner.client)
     runner.equal(code, 0, "green")
-    runner.check("the price cache (CMD_SYNC_SHOP)" in report,
-                 "the shop cache was streamed")
-    runner.check("an unknown command is refused" in report,
+    runner.check("the price cache is streamed" in report, "the shop cache was streamed")
+    runner.check("an unsupported command is refused" in report,
                  "and an unsupported command is refused instead of faked")
     runner.check("CMD_REPAIR" in report, "a garage command was exercised")
+    runner.check("a second sync is answered" in report,
+                 "the client's repeated sync was answered too")
+    runner.check("the loot box updates the account" in report,
+                 "opening a box pushed a diff")
 
 
 def test_the_doctor_can_skip_the_session(runner: common.Runner) -> None:
     """``session=False`` only looks at the installation."""
     code, report = _report(runner.client, session=False)
     runner.equal(code, 0, "green:\n%s" % report)
-    runner.check("the bridge handshake" not in report, "no session was started")
+    runner.check("the handshake answers" not in report, "no session was started")
+    runner.check("The installation" in report, "only the installation was checked")
 
 
 def test_the_doctor_reports_a_missing_mod_and_space(runner: common.Runner) -> None:
@@ -157,8 +162,12 @@ def test_a_packed_installation_is_fully_checked(runner: common.Runner) -> None:
             pass  # an (empty) package named after the space is enough
         code, report = _report(root)
         runner.equal(code, 0, "the packed installation is green:\n%s" % report)
-        runner.check("the New Year hangar space" in report, "the space check ran")
-        runner.check("New Year definitions" in report, "the catalogue was read")
+        runner.check("the New Year hangar space is in the packages" in report,
+                     "the space check ran")
+        runner.check("the New Year definitions are complete" in report,
+                     "the catalogue was read")
+        runner.check("the client mod is not installed yet" in report,
+                     "and the missing mod is only a warning")
     finally:
         import shutil
 
