@@ -1,0 +1,1055 @@
+"""Client-derived catalogs: the New Year event and the vehicle catalogue.
+
+The catalogs are the contract between the client and this server.  Both sides
+read the same ``item_defs`` XML of the player's installation, so the identifiers
+(toy ids, box/chest ids, component ids, compact descriptors) always agree; the
+server only decides *what happens*, never what an item *is*.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Sequence, Tuple
+
+from . import items as items_module
+from . import ny_constants as nyc
+from . import tankmen as tankmen_module
+from .defs import DefsError, DefsSource, parse_xml
+
+NY_FILES = {
+    "toys": "new_year/toys.xml",
+    "slots": "new_year/slots.xml",
+    "chests": "new_year/chests.xml",
+    "boxes": "new_year/boxes.xml",
+    "variadic_discounts": "new_year/variadic_discounts.xml",
+    "variadic_tankmen": "new_year/variadic_tankmen.xml",
+    "collection_rewards": "new_year/collection_rewards.xml",
+}
+
+NUMERIC_ID_RE = re.compile(r"^[A-Za-z]")
+
+
+# --------------------------------------------------------------------------
+# New Year catalog
+# --------------------------------------------------------------------------
+@dataclass(frozen=True)
+class NyToy:
+    id: int
+    type: str
+    setting: str
+    rank: int
+    setting_id: int = 0
+    atmosphere: int = 0
+    rating: int = 0
+    fragments: int = 0
+    icon: str = ""
+    slot_icon: str = ""
+    name: str = ""
+    hanging_effect: str = ""
+
+    def as_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "type": self.type,
+            "setting": self.setting,
+            "settingID": self.setting_id,
+            "rank": self.rank,
+            "atmosphere": self.atmosphere,
+            "rating": self.rating,
+            "fragments": self.fragments,
+            "icon": self.icon,
+            "slotIcon": self.slot_icon,
+            "name": self.name,
+            "hangingEffect": self.hanging_effect,
+        }
+
+
+@dataclass(frozen=True)
+class NySlot:
+    id: int
+    type: str
+    object: str = ""
+    nodes: str = ""
+    direction: str = ""
+
+
+@dataclass(frozen=True)
+class NyBox:
+    id: str
+    setting: Optional[str] = None
+    present: bool = False
+
+    @property
+    def setting_id(self) -> Optional[int]:
+        if self.setting is None:
+            return None
+        return nyc.NATIONAL_SETTINGS_IDS_BY_NAME.get(self.setting)
+
+
+@dataclass(frozen=True)
+class NyChest:
+    id: str
+    level: int
+
+
+@dataclass(frozen=True)
+class NyVariadicDiscount:
+    id: str
+    goodies_range: Tuple[int, int]
+
+
+@dataclass(frozen=True)
+class NyVariadicTankman:
+    id: str
+    level: int
+
+
+@dataclass(frozen=True)
+class NyCollectionReward:
+    id: str
+    setting: str
+    setting_id: int
+
+
+class CatalogError(Exception):
+    pass
+
+
+class NyCatalog:
+    """Everything the event needs to know about toys, slots and containers."""
+
+    def __init__(
+        self,
+        toys: Dict[int, NyToy],
+        slots: Sequence[NySlot],
+        boxes: Dict[str, NyBox],
+        chests: Dict[str, NyChest],
+        variadic_discounts: Dict[str, NyVariadicDiscount],
+        variadic_tankmen: Dict[str, NyVariadicTankman],
+        collection_rewards: Sequence[NyCollectionReward],
+    ):
+        self.toys = dict(toys)
+        self.slots = list(slots)
+        self.boxes = dict(boxes)
+        self.chests = dict(chests)
+        self.variadic_discounts = dict(variadic_discounts)
+        self.variadic_tankmen = dict(variadic_tankmen)
+        self.collection_rewards = list(collection_rewards)
+
+        self.chest_id_by_level: Dict[int, str] = {}
+        for chest in self.chests.values():
+            self.chest_id_by_level[chest.level] = chest.id
+
+        self.collection_reward_by_setting = {reward.setting: reward.id for reward in self.collection_rewards}
+
+        self.toy_groups: Dict[int, List[int]] = {}
+        for toy in self.toys.values():
+            group_id = (nyc.TOY_TYPES_IDS_BY_NAME[toy.type] << 16) | (toy.setting_id << 8) | toy.rank
+            self.toy_groups.setdefault(group_id, []).append(toy.id)
+        for ids in self.toy_groups.values():
+            ids.sort()
+
+        self.toys_by_setting_and_type: Dict[Tuple[str, str], List[NyToy]] = {}
+        for toy in self.toys.values():
+            self.toys_by_setting_and_type.setdefault((toy.setting, toy.type), []).append(toy)
+        for toys in self.toys_by_setting_and_type.values():
+            toys.sort(key=lambda toy: toy.id)
+
+        self.boxes_by_setting: Dict[Optional[str], List[NyBox]] = {}
+        for box in self.boxes.values():
+            self.boxes_by_setting.setdefault(box.setting, []).append(box)
+        for boxes in self.boxes_by_setting.values():
+            boxes.sort(key=lambda box: box.id)
+
+    # -- helpers ---------------------------------------------------------
+    def toys_of_setting(self, setting: str, types: Sequence[str] = None, rank: int = None) -> List[NyToy]:
+        result = []
+        for toy in self.toys.values():
+            if toy.setting != setting:
+                continue
+            if types is not None and toy.type not in types:
+                continue
+            if rank is not None and toy.rank != rank:
+                continue
+            result.append(toy)
+        result.sort(key=lambda toy: toy.id)
+        return result
+
+    def toys_of_group(self, toy_type: str, setting: str, rank: int) -> List[NyToy]:
+        type_id = nyc.TOY_TYPES_IDS_BY_NAME.get(toy_type)
+        setting_id = nyc.NATIONAL_SETTINGS_IDS_BY_NAME.get(setting)
+        if type_id is None or setting_id is None:
+            return []
+        group_id = (type_id << 16) | (setting_id << 8) | rank
+        return [self.toys[toy_id] for toy_id in self.toy_groups.get(group_id, ())]
+
+    def box(self, box_id: str) -> Optional[NyBox]:
+        return self.boxes.get(box_id)
+
+    def chest(self, chest_id: str) -> Optional[NyChest]:
+        return self.chests.get(chest_id)
+
+    def boxes_for_setting(self, setting: Optional[str], present: bool = False) -> List[NyBox]:
+        return [box for box in self.boxes_by_setting.get(setting, ()) if box.present == present]
+
+    def validate(self):
+        """Reproduce the client's own consistency checks (fail fast, not later)."""
+        slot_ids = sorted(slot.id for slot in self.slots)
+        if slot_ids != list(range(len(self.slots))):
+            raise CatalogError("slot ids must be 0..%d, got %s" % (len(self.slots) - 1, slot_ids))
+        for slot in self.slots:
+            if slot.type not in nyc.TOY_TYPES:
+                raise CatalogError("slot %d has unknown type %r" % (slot.id, slot.type))
+        for toy in self.toys.values():
+            if not 0 <= toy.id <= nyc.MAX_TOY_ID:
+                raise CatalogError("toy id out of the collection bit set: %d" % toy.id)
+            if toy.type not in nyc.TOY_TYPES:
+                raise CatalogError("toy %d has unknown type %r" % (toy.id, toy.type))
+            if toy.setting not in nyc.NATIONAL_SETTINGS:
+                raise CatalogError("toy %d has unknown setting %r" % (toy.id, toy.setting))
+            if not 1 <= toy.rank <= nyc.MAX_TOY_RANK:
+                raise CatalogError("toy %d has unknown rank %r" % (toy.id, toy.rank))
+        missing = []
+        for type_id, toy_type in enumerate(nyc.TOY_TYPES):
+            for setting_id, setting in enumerate(nyc.NATIONAL_SETTINGS):
+                for rank in range(1, nyc.MAX_TOY_RANK + 1):
+                    group_id = (type_id << 16) | (setting_id << 8) | rank
+                    if not self.toy_groups.get(group_id):
+                        missing.append((toy_type, setting, rank))
+        if missing:
+            raise CatalogError("incomplete toy groups (crafting would be broken): %s" % (missing,))
+        for chest in self.chests.values():
+            if not 1 <= chest.level <= nyc.MAX_CHEST_LEVEL:
+                raise CatalogError("chest %s has wrong level %d" % (chest.id, chest.level))
+        for level in range(1, nyc.MAX_CHEST_LEVEL + 1):
+            if level not in self.chest_id_by_level:
+                raise CatalogError("no chest descriptor for level %d" % level)
+        for box in self.boxes.values():
+            if box.setting is not None and box.setting not in nyc.NATIONAL_SETTINGS:
+                raise CatalogError("box %s has unknown setting %r" % (box.id, box.setting))
+        for reward in self.collection_rewards:
+            if reward.setting not in nyc.NATIONAL_SETTINGS:
+                raise CatalogError("collection reward %s has unknown setting" % reward.id)
+
+    # -- serialization ---------------------------------------------------
+    def to_json(self) -> dict:
+        return {
+            "toys": [self.toys[toy_id].as_dict() for toy_id in sorted(self.toys)],
+            "slots": [
+                {"id": slot.id, "type": slot.type, "object": slot.object, "nodes": slot.nodes, "direction": slot.direction}
+                for slot in self.slots
+            ],
+            "boxes": [{"id": box.id, "setting": box.setting, "present": box.present} for box in self.boxes.values()],
+            "chests": [{"id": chest.id, "level": chest.level} for chest in self.chests.values()],
+            "variadicDiscounts": [
+                {"id": entry.id, "goodiesRange": list(entry.goodies_range)}
+                for entry in self.variadic_discounts.values()
+            ],
+            "variadicTankmen": [
+                {"id": entry.id, "level": entry.level} for entry in self.variadic_tankmen.values()
+            ],
+            "collectionRewards": [
+                {"id": reward.id, "setting": reward.setting} for reward in self.collection_rewards
+            ],
+        }
+
+    @classmethod
+    def from_json(cls, payload: dict) -> "NyCatalog":
+        toys = {}
+        for raw in payload["toys"]:
+            setting = raw["setting"]
+            rank = int(raw["rank"])
+            toys[int(raw["id"])] = NyToy(
+                id=int(raw["id"]),
+                type=raw["type"],
+                setting=setting,
+                rank=rank,
+                setting_id=nyc.NATIONAL_SETTINGS_IDS_BY_NAME[setting],
+                atmosphere=nyc.TOY_ATMOSPHERE_BY_RANK[rank - 1],
+                rating=nyc.TOY_RATING_BY_RANK[rank - 1],
+                fragments=nyc.CRAFT.FRAGMENTS_BY_RANK[rank - 1],
+                icon=raw.get("icon", ""),
+                slot_icon=raw.get("slotIcon", ""),
+                name=raw.get("name", ""),
+                hanging_effect=raw.get("hangingEffect", ""),
+            )
+        slots = [
+            NySlot(
+                id=int(raw["id"]),
+                type=raw["type"],
+                object=raw.get("object", ""),
+                nodes=raw.get("nodes", ""),
+                direction=raw.get("direction", ""),
+            )
+            for raw in payload["slots"]
+        ]
+        boxes = {
+            raw["id"]: NyBox(id=raw["id"], setting=raw.get("setting"), present=bool(raw.get("present", False)))
+            for raw in payload["boxes"]
+        }
+        chests = {raw["id"]: NyChest(id=raw["id"], level=int(raw["level"])) for raw in payload["chests"]}
+        variadic_discounts = {
+            raw["id"]: NyVariadicDiscount(id=raw["id"], goodies_range=tuple(raw["goodiesRange"]))
+            for raw in payload["variadicDiscounts"]
+        }
+        variadic_tankmen = {
+            raw["id"]: NyVariadicTankman(id=raw["id"], level=int(raw["level"]))
+            for raw in payload["variadicTankmen"]
+        }
+        collection_rewards = [
+            NyCollectionReward(
+                id=raw["id"],
+                setting=raw["setting"],
+                setting_id=nyc.NATIONAL_SETTINGS_IDS_BY_NAME[raw["setting"]],
+            )
+            for raw in payload["collectionRewards"]
+        ]
+        catalog = cls(toys, slots, boxes, chests, variadic_discounts, variadic_tankmen, collection_rewards)
+        catalog.validate()
+        return catalog
+
+
+def load_ny_catalog(source: DefsSource, validate: bool = True) -> NyCatalog:
+    """Read ``new_year/*.xml`` from the client (or a JSON export)."""
+    exported = source.json_payload()
+    if exported is not None:
+        return NyCatalog.from_json(exported["newYear"])
+
+    toys_section = source.read_section(NY_FILES["toys"])
+    toys = {}
+    for entry in toys_section.subsections():
+        toy_id = entry.value_int("id", -1)
+        toy_type = entry.value("type", "")
+        setting = entry.value("setting", "")
+        rank = entry.value_int("rank", 0)
+        if toy_id < 0 or setting not in nyc.NATIONAL_SETTINGS or toy_type not in nyc.TOY_TYPES:
+            raise CatalogError("broken toy entry in %s: %r" % (NY_FILES["toys"], entry.values))
+        if not 1 <= rank <= nyc.MAX_TOY_RANK:
+            raise CatalogError("toy %d has rank %d" % (toy_id, rank))
+        if toy_id in toys:
+            raise CatalogError("repeated toy id %d" % toy_id)
+        toys[toy_id] = NyToy(
+            id=toy_id,
+            type=toy_type,
+            setting=setting,
+            rank=rank,
+            setting_id=nyc.NATIONAL_SETTINGS_IDS_BY_NAME[setting],
+            atmosphere=nyc.TOY_ATMOSPHERE_BY_RANK[rank - 1],
+            rating=nyc.TOY_RATING_BY_RANK[rank - 1],
+            fragments=nyc.CRAFT.FRAGMENTS_BY_RANK[rank - 1],
+            icon=entry.value("icon", ""),
+            slot_icon=entry.value("slotIcon", ""),
+            name=entry.value("name", ""),
+            hanging_effect=entry.value("hangingEffect", ""),
+        )
+
+    slots = [
+        NySlot(
+            id=entry.value_int("id", -1),
+            type=entry.value("type", ""),
+            object=entry.value("object", ""),
+            nodes=entry.value("nodes", ""),
+            direction=entry.value("direction", ""),
+        )
+        for entry in source.read_section(NY_FILES["slots"]).subsections()
+    ]
+
+    boxes = {}
+    for entry in source.read_section(NY_FILES["boxes"]).subsections():
+        setting = entry.value("setting", "") or None
+        boxes[entry.value("id", "")] = NyBox(
+            id=entry.value("id", ""), setting=setting, present=entry.value_bool("present", False)
+        )
+
+    chests = {}
+    for entry in source.read_section(NY_FILES["chests"]).subsections():
+        chests[entry.value("id", "")] = NyChest(id=entry.value("id", ""), level=entry.value_int("level", 0))
+
+    variadic_discounts = {}
+    for entry in source.read_section(NY_FILES["variadic_discounts"]).subsections():
+        bounds = entry.value_tokens("goodiesRange")
+        variadic_discounts[entry.value("id", "")] = NyVariadicDiscount(
+            id=entry.value("id", ""),
+            goodies_range=(int(bounds[0]), int(bounds[1])) if len(bounds) == 2 else (0, 0),
+        )
+
+    variadic_tankmen = {}
+    for entry in source.read_section(NY_FILES["variadic_tankmen"]).subsections():
+        variadic_tankmen[entry.value("id", "")] = NyVariadicTankman(
+            id=entry.value("id", ""), level=entry.value_int("level", 0)
+        )
+
+    collection_rewards = []
+    for entry in source.read_section(NY_FILES["collection_rewards"]).subsections():
+        setting = entry.value("setting", "")
+        collection_rewards.append(
+            NyCollectionReward(
+                id=entry.value("id", ""),
+                setting=setting,
+                setting_id=nyc.NATIONAL_SETTINGS_IDS_BY_NAME.get(setting, -1),
+            )
+        )
+
+    catalog = NyCatalog(toys, slots, boxes, chests, variadic_discounts, variadic_tankmen, collection_rewards)
+    if validate:
+        catalog.validate()
+    return catalog
+
+
+# --------------------------------------------------------------------------
+# Vehicle catalogue
+# --------------------------------------------------------------------------
+@dataclass
+class Component:
+    """An installable vehicle module (chassis, turret, gun, engine, ...)."""
+
+    type_name: str
+    name: str
+    id: int
+    nation_id: int
+    price_credits: int = 0
+    price_gold: int = 0
+    level: int = 0
+    unlocks: List[Tuple[str, str, int]] = field(default_factory=list)  # (group, name, cost)
+    shared: bool = True
+
+    @property
+    def compact_descr(self) -> int:
+        return items_module.make_int_compact_descr_by_id(self.type_name, self.nation_id, self.id)
+
+    def as_json(self) -> dict:
+        return {
+            "name": self.name,
+            "id": self.id,
+            "price": self.price_credits,
+            "priceGold": self.price_gold,
+            "level": self.level,
+            "unlocks": [[group, name, cost] for group, name, cost in self.unlocks],
+        }
+
+    @classmethod
+    def from_json(cls, type_name: str, payload: dict) -> "Component":
+        return cls(
+            type_name=type_name,
+            name=payload["name"],
+            id=int(payload["id"]),
+            nation_id=int(payload.get("nationID", 0)),
+            price_credits=int(payload.get("price", 0)),
+            price_gold=int(payload.get("priceGold", 0)),
+            level=int(payload.get("level", 0)),
+            unlocks=[(group, name, int(cost)) for group, name, cost in payload.get("unlocks", ())],
+        )
+
+
+@dataclass
+class TurretGroup:
+    turret: Component
+    guns: List[Component] = field(default_factory=list)
+    #: Turret position of the hull (``turrets0`` -> 0, ``turrets1`` -> 1, ...);
+    #: a vehicle descriptor carries one ``(turret, gun)`` pair per position.
+    position: int = 0
+
+
+@dataclass
+class VehicleType:
+    name: str
+    nation: str
+    nation_id: int
+    innation_id: int
+    level: int
+    tags: Tuple[str, ...] = ()
+    price_credits: int = 0
+    price_gold: int = 0
+    user_string: str = ""
+    short_user_string: str = ""
+    groups: Dict[str, List[Component]] = field(default_factory=dict)
+    turrets: List[TurretGroup] = field(default_factory=list)
+    not_in_shop: bool = False
+    #: One entry per crew slot of the hull, each listing the roles the slot
+    #: covers (``<crew><commander>gunner</commander><loader/></crew>`` ->
+    #: ``(('commander', 'gunner'), ('loader',))``).  This is exactly the client's
+    #: ``VehicleType.crewRoles``: a vehicle descriptor needs one tankman per
+    #: slot and the slot's *first* role is the one the member is recruited for
+    #: (``common/items/utils.generateDefaultCrew``).
+    crew_roles: Tuple[Tuple[str, ...], ...] = ()
+
+    @property
+    def compact_descr(self) -> int:
+        return items_module.make_vehicle_compact_descr(self.nation_id, self.innation_id)
+
+    @property
+    def is_secret(self) -> bool:
+        return "secret" in self.tags
+
+    @property
+    def is_premium(self) -> bool:
+        """``True`` for a vehicle that is paid for in gold.
+
+        The client marks those by price, not by tag
+        (``vehicles._readVehicleType``: ``if 'gold' in price: item.tags |=
+        frozenset(('premium',))``), and this build's ``list.xml`` writes the
+        currency as a child of ``<price>``.
+        """
+        return self.price_gold > 0 or "premium" in self.tags
+
+    def turrets_by_position(self) -> Dict[int, List[TurretGroup]]:
+        """Turret alternatives per turret position (``turrets0``, ``turrets1``, ...).
+
+        The client reads one ``turretsN`` section per turret position of the
+        hull and a vehicle descriptor carries one ``(turret, gun)`` pair for
+        every position, so the catalogue keeps the positions apart as well.
+        """
+        result: Dict[int, List[TurretGroup]] = {}
+        for group in self.turrets:
+            result.setdefault(group.position, []).append(group)
+        for groups in result.values():
+            groups.sort(key=lambda group: group.turret.id)
+        return result
+
+    def group(self, name: str) -> List[Component]:
+        return self.groups.get(name, [])
+
+    def stock_configuration(self) -> dict:
+        """The configuration a freshly bought vehicle has (first of every group).
+
+        Groups the client data leaves empty for a vehicle (the tiny shared
+        fuel-tank table, for instance) are allowed to be missing: they simply do
+        not appear in the resulting configuration until the caller asks for the
+        default id.
+        """
+        chassis = self.group("chassis")
+        engines = self.group("engines")
+        fuel_tanks = self.group("fuelTanks")
+        radios = self.group("radios")
+        positions = self.turrets_by_position()
+        if not (chassis and engines and radios and positions):
+            return {}
+        configuration = {
+            "chassis": chassis[0].id,
+            "engine": engines[0].id,
+            "radio": radios[0].id,
+            # One (turret, gun) pair per turret position of the hull; the first
+            # alternative of a position is the stock turret of that position.
+            "turrets": [
+                (groups[0].turret.id, groups[0].guns[0].id if groups[0].guns else 0)
+                for _position, groups in sorted(positions.items())
+            ],
+        }
+        if fuel_tanks:
+            configuration["fuelTank"] = fuel_tanks[0].id
+        return configuration
+
+    def top_configuration(self) -> dict:
+        """The fully researched configuration.
+
+        A component is "top" when it unlocks nothing else inside its own group
+        (a leaf of the research graph the client ships in the vehicle XML); ties
+        are broken by price so the result is deterministic.
+        """
+        configuration = self.stock_configuration()
+        if not configuration:
+            return {}
+        for group_name, key in (
+            ("chassis", "chassis"),
+            ("engines", "engine"),
+            ("fuelTanks", "fuelTank"),
+            ("radios", "radio"),
+        ):
+            components = self.group(group_name)
+            top = _top_component(components, group_name)
+            if top is not None:
+                configuration[key] = top.id
+        turrets = []
+        for _position, groups in sorted(self.turrets_by_position().items()):
+            turret = _top_component([group.turret for group in groups], "vehicleTurret")
+            if turret is None:
+                continue
+            guns = [gun for group in groups if group.turret is turret for gun in group.guns]
+            gun = _top_component(guns, "vehicleGun")
+            turrets.append((turret.id, gun.id if gun is not None else (guns[0].id if guns else 0)))
+        if turrets:
+            configuration["turrets"] = turrets
+        return configuration
+
+    def configuration_with_components(self, configuration: dict) -> dict:
+        """Return ``configuration`` completed with the missing groups (stock)."""
+        stock = self.stock_configuration()
+        result = dict(stock)
+        for key, value in (configuration or {}).items():
+            if value not in (None, 0, [], ()):
+                result[key] = value
+        return result
+
+    def find_component(self, group_name: str, component_id: int) -> Optional[Component]:
+        for component in self.group(group_name):
+            if component.id == component_id:
+                return component
+        return None
+
+    def find_gun(self, gun_id: int) -> Optional[Component]:
+        for group in self.turrets:
+            for gun in group.guns:
+                if gun.id == gun_id:
+                    return gun
+        return None
+
+    def find_turret_group(self, turret_id: int) -> Optional[TurretGroup]:
+        for group in self.turrets:
+            if group.turret.id == turret_id:
+                return group
+        return None
+
+    def as_json(self) -> dict:
+        return {
+            "name": self.name,
+            "nation": self.nation,
+            "nationID": self.nation_id,
+            "innationID": self.innation_id,
+            "level": self.level,
+            "tags": list(self.tags),
+            "price": self.price_credits,
+            "priceGold": self.price_gold,
+            "userString": self.user_string,
+            "shortUserString": self.short_user_string,
+            "notInShop": self.not_in_shop,
+            "groups": {
+                group_name: [component.as_json() for component in components]
+                for group_name, components in self.groups.items()
+            },
+            "crewRoles": [list(slot) for slot in self.crew_roles],
+            "turrets": [
+                {
+                    "turret": group.turret.as_json(),
+                    "guns": [gun.as_json() for gun in group.guns],
+                    "position": group.position,
+                }
+                for group in self.turrets
+            ],
+        }
+
+    @classmethod
+    def from_json(cls, payload: dict) -> "VehicleType":
+        groups = {}
+        for group_name, components in payload.get("groups", {}).items():
+            groups[group_name] = [Component.from_json(group_name, raw) for raw in components]
+        turrets = [
+            TurretGroup(
+                turret=Component.from_json("vehicleTurret", raw["turret"]),
+                guns=[Component.from_json("vehicleGun", raw) for raw in raw.get("guns", [])],
+                position=int(raw.get("position", 0)),
+            )
+            for raw in payload.get("turrets", [])
+        ]
+        return cls(
+            name=payload["name"],
+            nation=payload["nation"],
+            nation_id=int(payload["nationID"]),
+            innation_id=int(payload["innationID"]),
+            level=int(payload["level"]),
+            tags=tuple(payload.get("tags", ())),
+            price_credits=int(payload.get("price", 0)),
+            price_gold=int(payload.get("priceGold", 0)),
+            user_string=payload.get("userString", ""),
+            short_user_string=payload.get("shortUserString", ""),
+            groups=groups,
+            turrets=turrets,
+            not_in_shop=bool(payload.get("notInShop", False)),
+            crew_roles=tuple(tuple(slot) for slot in payload.get("crewRoles", ())),
+        )
+
+
+def _top_component(components: Sequence[Component], group_name: str, fallback: Optional[Component] = None):
+    """The last component of a research chain (a component unlocking nothing else).
+
+    ``<unlocks>`` in the client data points from a module to the module it opens,
+    so the ends of those chains are the fully researched modules.  Several ends
+    may exist (branches); the most expensive one wins, ties are broken by id so
+    the choice is reproducible.
+    """
+    if not components:
+        return fallback
+    known = {component.name for component in components}
+    candidates = []
+    for component in components:
+        opens_something = any(
+            group == group_name and name in known for group, name, _cost in component.unlocks
+        )
+        if not opens_something:
+            candidates.append(component)
+    if not candidates:
+        candidates = list(components)
+    return max(candidates, key=lambda component: (component.price_credits + component.price_gold * 1000, component.id))
+
+
+class VehicleCatalog:
+    def __init__(self, vehicles: Dict[int, VehicleType]):
+        self.vehicles = dict(vehicles)
+        self.by_name: Dict[str, VehicleType] = {vehicle.name: vehicle for vehicle in self.vehicles.values()}
+
+    def get(self, compact_descr: int) -> Optional[VehicleType]:
+        return self.vehicles.get(compact_descr)
+
+    def get_by_name(self, name: str) -> Optional[VehicleType]:
+        return self.by_name.get(name)
+
+    def all(self) -> List[VehicleType]:
+        return sorted(self.vehicles.values(), key=lambda vehicle: (vehicle.nation_id, vehicle.innation_id))
+
+    def playable(self) -> List[VehicleType]:
+        """Vehicles worth handing to a player (the client hides the rest anyway)."""
+        result = []
+        for vehicle in self.vehicles.values():
+            if not vehicle.groups or not vehicle.turrets:
+                continue
+            if "observer" in vehicle.tags:
+                continue
+            name = vehicle.name
+            if name.endswith("_bot") or name.endswith("_training") or name.endswith("_IGR"):
+                continue
+            if name.startswith("Env_") or name == "Observer":
+                continue
+            result.append(vehicle)
+        return sorted(result, key=lambda vehicle: (vehicle.nation_id, vehicle.innation_id))
+
+    def to_json(self) -> dict:
+        return {"vehicles": [vehicle.as_json() for vehicle in self.all()]}
+
+    @classmethod
+    def from_json(cls, payload: dict) -> "VehicleCatalog":
+        vehicles = {}
+        for raw in payload["vehicles"]:
+            vehicle = VehicleType.from_json(raw)
+            vehicles[vehicle.compact_descr] = vehicle
+        return cls(vehicles)
+
+
+# --------------------------------------------------------------------------
+# Combined catalog
+# --------------------------------------------------------------------------
+class Catalog:
+    def __init__(self, new_year: NyCatalog, vehicles: VehicleCatalog, meta: dict = None):
+        self.new_year = new_year
+        self.vehicles = vehicles
+        self.meta = meta or {}
+
+    def validate(self):
+        self.new_year.validate()
+
+    def to_json(self) -> dict:
+        payload = {
+            "schema": 1,
+            "generatedBy": "New-Year-Wot-0.9.22-hangar",
+            "clientBuild": self.meta.get("clientBuild", "0.9.22.0.1 #1513"),
+            "newYear": self.new_year.to_json(),
+            "vehicles": self.vehicles.to_json()["vehicles"],
+        }
+        return payload
+
+    @classmethod
+    def from_json(cls, payload: dict) -> "Catalog":
+        if int(payload.get("schema", 0)) != 1:
+            raise CatalogError("unsupported catalog schema: %r" % (payload.get("schema"),))
+        new_year = NyCatalog.from_json(payload["newYear"])
+        vehicles = VehicleCatalog.from_json({"vehicles": payload["vehicles"]})
+        return cls(new_year, vehicles, payload)
+
+    @classmethod
+    def load(cls, source: DefsSource) -> "Catalog":
+        """Load both catalogs from a client tree, an archive or a JSON export."""
+        exported = source.json_payload()
+        if exported is not None:
+            return cls.from_json(exported)
+        new_year = load_ny_catalog(source)
+        vehicles = load_vehicle_catalog(source)
+        return cls(new_year, vehicles)
+
+
+# --------------------------------------------------------------------------
+# Vehicle parsing
+# --------------------------------------------------------------------------
+COMPONENT_GROUP_FILES = {
+    "chassis": "vehicles/%s/components/chassis.xml",
+    "turret": "vehicles/%s/components/turrets.xml",
+    "gun": "vehicles/%s/components/guns.xml",
+    "engine": "vehicles/%s/components/engines.xml",
+    "fuelTank": "vehicles/%s/components/fuelTanks.xml",
+    "radio": "vehicles/%s/components/radios.xml",
+}
+COMPONENT_GROUP_TYPES = {
+    "chassis": "vehicleChassis",
+    "turret": "vehicleTurret",
+    "gun": "vehicleGun",
+    "engine": "vehicleEngine",
+    "fuelTank": "vehicleFuelTank",
+    "radio": "vehicleRadio",
+}
+
+
+def _parse_component_file(section, group_name: str, nation_id: int) -> Dict[str, Component]:
+    """Read ``<ids>`` + ``<shared>`` of a nation component file."""
+    ids_section = section.subsection("ids")
+    components: Dict[str, Component] = {}
+    if ids_section is None:
+        return components
+    for name, text in ids_section.values.items():
+        if name == "value":
+            continue
+        component_id = _int_from_text(text)
+        if component_id < 0:
+            continue
+        components[name] = Component(
+            type_name=COMPONENT_GROUP_TYPES[group_name],
+            name=name,
+            id=component_id,
+            nation_id=nation_id,
+        )
+    shared = section.subsection("shared")
+    if shared is not None:
+        for entry in shared.children:
+            component = components.get(entry.name)
+            if component is None:
+                continue
+            price, currency = _read_price(entry)
+            component.price_credits = price if currency == "credits" else 0
+            component.price_gold = price if currency == "gold" else 0
+            component.level = entry.value_int("level", 0)
+            component.unlocks = _read_unlocks(entry)
+    return components
+
+
+def _read_unlocks(section) -> List[Tuple[str, str, int]]:
+    unlocks = section.subsection("unlocks")
+    result: List[Tuple[str, str, int]] = []
+    if unlocks is None:
+        return result
+    for entry in unlocks.children:
+        group = _normalise_unlock_group(entry.name)
+        name = entry.value("value", "").split()
+        if not name:
+            continue
+        result.append((group, name[0], entry.value_int("cost", 0)))
+    return result
+
+
+def _normalise_unlock_group(name: str) -> str:
+    mapping = {
+        "chassis": "chassis",
+        "turrets": "turret",
+        "guns": "gun",
+        "engines": "engine",
+        "fuelTanks": "fuelTank",
+        "radios": "radio",
+        "vehicle": "vehicle",
+    }
+    return mapping.get(name, name)
+
+
+def _read_price(section, name: str = "price") -> Tuple[int, str]:
+    """Read ``<price>`` the way the client does.
+
+    ``vehicles._readVehicleType`` adds the ``premium`` tag when the price is
+    paid in gold, and the currency is written as a child element of ``<price>``
+    (``<price>\t11800\t<gold></gold></price>``); a plain number means credits.
+    """
+    entry = section.subsection(name)
+    if entry is None:
+        return 0, "credits"
+    amount = _int_from_text(entry.values.get("value", ""))
+    if amount <= 0:
+        amount = _int_from_text(entry.values.get(name, ""))
+    for child in entry.children:
+        currency = child.name.strip().lower()
+        if currency in ("gold", "credits", "crystal"):
+            return amount, currency
+    for currency in ("gold", "credits", "crystal"):
+        if currency in entry.values:
+            return amount, currency
+    return amount, "credits"
+
+
+def _int_from_text(text: str) -> int:
+    text = (text or "").strip()
+    if not text:
+        return -1
+    try:
+        return int(text)
+    except ValueError:
+        return -1
+
+
+def load_vehicle_catalog(source: DefsSource, nations: Sequence[str] = nyc.NATIONS) -> VehicleCatalog:
+    vehicles: Dict[int, VehicleType] = {}
+    for nation in nations:
+        nation_id = nyc.NATION_INDICES[nation]
+        components: Dict[str, Dict[str, Component]] = {}
+        for group_name, pattern in COMPONENT_GROUP_FILES.items():
+            path = pattern % nation
+            if not source.has(path):
+                continue
+            components[group_name] = _parse_component_file(source.read_section(path), group_name, nation_id)
+
+        list_section = source.read_section("vehicles/%s/list.xml" % nation)
+        for entry in list_section.subsections():
+            vehicle_name = entry.name
+            innation_id = entry.value_int("id", -1)
+            if innation_id < 0:
+                continue
+            price, currency = _read_price(entry)
+            vehicle = VehicleType(
+                name=vehicle_name,
+                nation=nation,
+                nation_id=nation_id,
+                innation_id=innation_id,
+                level=entry.value_int("level", 0),
+                tags=tuple(entry.value_tokens("tags")),
+                price_credits=price if currency == "credits" else 0,
+                price_gold=price if currency == "gold" else 0,
+                user_string=entry.value("userString", ""),
+                short_user_string=entry.value("shortUserString", ""),
+                not_in_shop=entry.value_bool("notInShop", False),
+            )
+            vehicle_path = _find_vehicle_xml(source, nation, vehicle_name)
+            if vehicle_path is not None:
+                _apply_vehicle_xml(vehicle, source.read_section(vehicle_path), components)
+            vehicles[vehicle.compact_descr] = vehicle
+    return VehicleCatalog(vehicles)
+
+
+_VEHICLE_FILE_INDEX: Dict[str, Dict[str, str]] = {}
+
+
+def _find_vehicle_xml(source: DefsSource, nation: str, vehicle_name: str) -> Optional[str]:
+    cache_key = "%s|%s" % (id(source), nation)
+    index = _VEHICLE_FILE_INDEX.get(cache_key)
+    if index is None:
+        index = {}
+        for path in source.list_vehicle_files(nation):
+            base = path.rsplit("/", 1)[-1][:-4]
+            index.setdefault(base.lower(), path)
+        _VEHICLE_FILE_INDEX[cache_key] = index
+    return index.get(vehicle_name.lower())
+
+
+def _read_crew_roles(section) -> Tuple[Tuple[str, ...], ...]:
+    """The crew slots of ``<crew>``, mirroring ``vehicles._readCrew``.
+
+    Every child is one slot; the space separated text of the element lists the
+    extra roles the member of that slot takes over (a T-34 commander is also
+    its gunner), which is what ``common/items/utils`` relies on.
+    """
+    crew = section.subsection("crew")
+    if crew is None:
+        return ()
+    slots = []
+    for child in crew.children:
+        roles = [child.name]
+        for extra in child.value_tokens("value"):
+            if extra in tankmen_module.ROLES and extra != child.name and extra not in roles:
+                roles.append(extra)
+        slots.append(tuple(roles))
+    return tuple(slots)
+
+
+def _apply_vehicle_xml(vehicle: VehicleType, section, components: Dict[str, Dict[str, Component]]) -> None:
+    vehicle.crew_roles = _read_crew_roles(section)
+    groups: Dict[str, List[Component]] = {}
+    for group_name in ("chassis", "engines", "fuelTanks", "radios"):
+        group_section = section.subsection(group_name)
+        if group_section is None:
+            continue
+        group_key = {
+            "chassis": "chassis",
+            "engines": "engine",
+            "fuelTanks": "fuelTank",
+            "radios": "radio",
+        }[group_name]
+        members = []
+        table = components.get(group_key, {})
+        for entry in group_section.children:
+            component = table.get(entry.name)
+            if component is None:
+                component = Component(
+                    type_name=COMPONENT_GROUP_TYPES[group_key],
+                    name=entry.name,
+                    id=-1,
+                    nation_id=vehicle.nation_id,
+                )
+            unlocks = _read_unlocks(entry)
+            local_price, local_currency = _read_price(entry)
+            if unlocks or local_price or entry.value_int("level", 0):
+                component = Component(
+                    type_name=component.type_name,
+                    name=component.name,
+                    id=component.id,
+                    nation_id=component.nation_id,
+                    # The vehicle file repeats a module that the nation component
+                    # file owns; keep the shared price when the local entry has none.
+                    price_credits=(local_price if local_currency == "credits" else 0)
+                    or component.price_credits,
+                    price_gold=local_price if local_currency == "gold" else component.price_gold,
+                    level=entry.value_int("level", component.level),
+                    unlocks=unlocks or component.unlocks,
+                )
+            members.append(component)
+        groups[group_name] = [component for component in members if component.id >= 0]
+
+    turret_groups: List[TurretGroup] = []
+    turret_table = components.get("turret", {})
+    gun_table = components.get("gun", {})
+    index = 0
+    while True:
+        turret_section = section.subsection("turrets%d" % index)
+        if turret_section is None:
+            break
+        for entry in turret_section.children:
+            turret = turret_table.get(entry.name)
+            if turret is None:
+                turret = Component(
+                    type_name="vehicleTurret",
+                    name=entry.name,
+                    id=-1,
+                    nation_id=vehicle.nation_id,
+                )
+            guns = []
+            guns_section = entry.subsection("guns")
+            if guns_section is not None:
+                for gun_entry in guns_section.children:
+                    gun = gun_table.get(gun_entry.name)
+                    if gun is None:
+                        gun = Component(
+                            type_name="vehicleGun",
+                            name=gun_entry.name,
+                            id=-1,
+                            nation_id=vehicle.nation_id,
+                        )
+                    guns.append(gun)
+            if turret.id >= 0:
+                turret_groups.append(
+                    TurretGroup(turret=turret, guns=[gun for gun in guns if gun.id >= 0], position=index)
+                )
+        index += 1
+
+    vehicle.groups = groups
+    vehicle.turrets = turret_groups
+
+
+__all__ = [
+    "Catalog",
+    "CatalogError",
+    "Component",
+    "NyBox",
+    "NyCatalog",
+    "NyChest",
+    "NyCollectionReward",
+    "NySlot",
+    "NyToy",
+    "NyVariadicDiscount",
+    "NyVariadicTankman",
+    "TurretGroup",
+    "VehicleCatalog",
+    "VehicleType",
+    "load_ny_catalog",
+    "load_vehicle_catalog",
+]

@@ -1,0 +1,233 @@
+"""``python3 -m server`` - run the local World of Tanks 0.9.22 server.
+
+Usage::
+
+    python3 -m server --client /path/to/World_of_Tanks
+    python3 -m server --catalog catalog.json --save server/data/account.json
+    python3 -m server info --client /path/to/World_of_Tanks
+
+The server reads the player's own installation (no game data is bundled, see
+:mod:`server.loader`), prepares a local account with a garage and the New Year
+2018 event switched on, and then waits for the in-client bridge (the mod under
+``client_mod/``) to connect on ``127.0.0.1``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import sys
+
+from . import loader
+from .account_rpc.server import DEFAULT_HOST, DEFAULT_PORT, AccountServer
+from .account_rpc.state import AccountState
+
+DEFAULT_SAVE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "account.json")
+DEFAULT_CATALOG_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "catalog.json")
+
+
+def _configure_logging(verbose: int) -> None:
+    level = logging.WARNING
+    if verbose == 1:
+        level = logging.INFO
+    elif verbose >= 2:
+        level = logging.DEBUG
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python3 -m server",
+        description="Local server for World of Tanks 0.9.22 (New Year hangar, loot boxes, "
+                    "New Year offensive)",
+    )
+    parser.add_argument("--client", help="path to the World of Tanks installation")
+    parser.add_argument("--catalog", help="path to catalog.json (tools/extract_client_catalog.py)")
+    parser.add_argument("--host", default=DEFAULT_HOST, help="bind address (default: %(default)s)")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="TCP port (default: %(default)s)")
+    parser.add_argument("--save", default=DEFAULT_SAVE, help="account file (default: %(default)s)")
+    parser.add_argument("--fresh", action="store_true", help="ignore the saved account and start over")
+    parser.add_argument("--data", default=DEFAULT_CATALOG_CACHE,
+                        help="account file (default: %(default)s)")
+    parser.add_argument("--free-xp", type=int, default=None, help="override the starting free XP")
+    parser.add_argument("--credits", type=int, default=None, help="override the starting credits")
+    parser.add_argument("--gold", type=int, default=None, help="override the starting gold")
+    parser.add_argument("--only-nation", action="append", default=None,
+                        help="fill the garage with one nation only (repeatable)")
+    parser.add_argument("--garage", default="researchable", choices=("researchable", "premium", "all"),
+                        help="what the starting garage contains (default: %(default)s)")
+    parser.add_argument("-v", "--verbose", action="count", default=0, help="-v info, -vv debug")
+    parser.add_argument("command", nargs="?", default="serve", choices=("serve", "info", "extract"),
+                        help="what to do (default: serve)")
+    return parser
+
+
+def _resolve_source(args) -> str:
+    if args.catalog:
+        return args.catalog
+    if args.client:
+        return args.client
+    guess = loader.guess_client()
+    if guess:
+        logging.info("using the installation found at %s", guess)
+        return guess
+    raise SystemExit(
+        "no World of Tanks installation found; pass --client /path/to/World_of_Tanks "
+        "or --catalog catalog.json"
+    )
+
+
+def _load_catalog(args, source: str):
+    logging.info("reading game data from %s", loader.source_description(source))
+    catalog = loader.load_catalog(source)
+    catalog.validate()
+    logging.info(
+        "catalogue: %d vehicles, %d decorations, %d boxes, %d chests",
+        len(catalog.vehicles.all()), len(catalog.new_year.toys),
+        len(catalog.new_year.boxes), len(catalog.new_year.chests),
+    )
+    return catalog
+
+
+def _build_account(args, catalog, source: str) -> AccountState:
+    from .game import ny_constants as nyc
+
+    tankmen_configs = {}
+    if not os.path.isfile(source):
+        try:
+            tankmen_configs = loader.load_tankmen_configs(source)
+        except Exception as error:  # pragma: no cover - data dependent
+            logging.warning("tankman name lists unavailable: %s", error)
+    else:
+        client = loader.guess_client()
+        if client:
+            try:
+                tankmen_configs = loader.load_tankmen_configs(client)
+            except Exception as error:  # pragma: no cover
+                logging.warning("tankman name lists unavailable: %s", error)
+
+    overrides = {}
+    if args.credits is not None:
+        overrides["credits"] = args.credits
+    if args.gold is not None:
+        overrides["gold"] = args.gold
+    if args.free_xp is not None:
+        overrides["free_xp"] = args.free_xp
+
+    if tankmen_configs:
+        logging.info("tankman name lists loaded for %d nations", len(tankmen_configs))
+    else:
+        logging.warning("no tankman name lists: crew members and the New Year tankwoman "
+                        "will be unavailable")
+
+    state = AccountState.new(catalog, tankmen_configs=tankmen_configs,
+                             garage_mode=getattr(args, "garage", "researchable"), **overrides)
+    nation_ids = None
+    if args.only_nation:
+        nation_ids = [nyc.NATION_INDICES[name] for name in args.only_nation if name in nyc.NATION_INDICES]
+        state.vehicles.clear()
+        state.tankmen.clear()
+        state.unlocks.clear()
+        state.elite_vehicles.clear()
+    if nation_ids:
+        state.grant_garage(nation_ids=nation_ids, mode=args.garage)
+    return state
+
+
+def _load_account(args, catalog, source: str) -> AccountState:
+    if args.save and os.path.isfile(args.save) and not args.fresh:
+        import json
+
+        with open(args.save, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        tankman_factory = None
+        if not os.path.isfile(source):
+            try:
+                configs = loader.load_tankmen_configs(source)
+                if configs:
+                    from .game import tankmen as tankmen_module
+
+                    tankman_factory = tankmen_module.TankmanFactory(configs)
+            except Exception as error:  # pragma: no cover
+                logging.warning("tankman name lists unavailable: %s", error)
+        state = AccountState.from_json(payload, catalog, tankman_factory=tankman_factory)
+        logging.info(
+            "account loaded from %s: %d vehicles, %d crew, level %d, %.0f credits",
+            args.save, len(state.vehicles), len(state.tankmen),
+            state.new_year.state.level, state.credits,
+        )
+        return state
+    state = _build_account(args, catalog, source)
+    logging.info(
+        "new account: %d vehicles, %d crew, %d decorations in boxes",
+        len(state.vehicles), len(state.tankmen), sum(state.new_year.state.boxes.values()),
+    )
+    return state
+
+
+def _command_info(args) -> int:
+    source = _resolve_source(args)
+    catalog = _load_catalog(args, source)
+    ny = catalog.new_year
+    print("source          : %s" % loader.source_description(source))
+    print("vehicles        : %d" % len(catalog.vehicles.all()))
+    print("decorations     : %d (in %d groups)" % (len(ny.toys), len(ny.toy_groups)))
+    print("slots           : %d" % len(ny.slots))
+    print("loot boxes      : %s" % ", ".join(sorted(ny.boxes)))
+    print("chests          : %s" % ", ".join(sorted(ny.chests)))
+    print("discount certs  : %s" % ", ".join(sorted(ny.variadic_discounts)))
+    print("tankman certs   : %s" % ", ".join(sorted(ny.variadic_tankmen)))
+    print("collection rew. : %s" % ", ".join(sorted(reward.id for reward in ny.collection_rewards)))
+    return 0
+
+
+def _command_extract(args) -> int:
+    from tools import extract_client_catalog
+
+    source = _resolve_source(args)
+    target = args.data if args.data.endswith(".json") else DEFAULT_CATALOG_CACHE
+    extract_client_catalog.extract(source, target, include_vehicles=True)
+    print("written %s" % target)
+    return 0
+
+
+def _command_serve(args) -> int:
+    source = _resolve_source(args)
+    catalog = _load_catalog(args, source)
+    state = _load_account(args, catalog, source)
+    server = AccountServer(state, host=args.host, port=args.port, save_path=args.save)
+    server.start()
+    print("")
+    print("Local World of Tanks 0.9.22 server is up.")
+    print("  game data : %s" % loader.source_description(source))
+    print("  bridge    : %s:%d (the client mod connects here)" % (server.host, server.port))
+    print("  account   : %s" % (args.save or "<not saved>"))
+    print("  garage    : %d vehicles, %d crew" % (len(state.vehicles), len(state.tankmen)))
+    print("  event     : Новогоднее наступление, level %d, %d boxes, %d chests" % (
+        state.new_year.state.level,
+        sum(state.new_year.state.boxes.values()),
+        sum(state.new_year.state.chests.values()),
+    ))
+    print("")
+    print("Press Ctrl+C to stop (the account is saved on exit).")
+    server.serve_forever()
+    return 0
+
+
+def main(argv=None) -> int:
+    args = _build_parser().parse_args(argv)
+    _configure_logging(args.verbose)
+    if args.command == "info":
+        return _command_info(args)
+    if args.command == "extract":
+        return _command_extract(args)
+    return _command_serve(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
