@@ -38,12 +38,24 @@ from ..game import shop as shop_module
 from ..game import rewards as rewards_module
 from ..game import tankmen as tankmen_module
 from ..game import vehicle_descr as descr_module
+from ..game import catalog as catalog_module
 from ..game.catalog import Catalog, VehicleType
 from ..game.events import EventDataBuilder
 
 #: ``GUI_ITEM_TYPE`` indexes of the client (``gui.shared.gui_items``).
 VEHICLE = items_module.GUI_ITEM_TYPE.VEHICLE
 TANKMAN = items_module.GUI_ITEM_TYPE.TANKMAN
+
+#: ``vehicles.NUM_EQUIPMENT_SLOTS`` - the four slots of a regular equipment
+#: layout.  ``VehicleEquipment`` builds a container of exactly this size out of
+#: the ``eqs``/``eqsLayout`` lists of the inventory, so they are padded.
+EQUIPMENT_LAYOUT_SIZE = 4
+
+
+def _pad_slots(values, size: int = EQUIPMENT_LAYOUT_SIZE) -> List[int]:
+    """``values`` as a fixed-size list of ints (missing slots become ``0``)."""
+    padded = [int(value or 0) for value in list(values or ())[:size]]
+    return padded + [0] * (size - len(padded))
 
 #: Starting wallet of a fresh local account.
 DEFAULT_CREDITS = 10000000
@@ -79,12 +91,27 @@ class VehicleEntry:
     #: Tankman inventory ids that make up the crew.
     crew: List[int] = field(default_factory=list)
     settings: int = 0
-    equipment: List[int] = field(default_factory=lambda: [0, 0, 0])
-    equipment_layout: Dict[int, List[int]] = field(default_factory=dict)
+    #: The equipment the vehicle carries (``eqs``): one compact descriptor per
+    #: slot, ``0`` for an empty one.  ``NUM_EQUIPMENT_SLOTS`` = 4 - three
+    #: regular consumables and one battle booster
+    #: (``gui_items.vehicle_equipment``).
+    equipment: List[int] = field(default_factory=lambda: [0, 0, 0, 0])
+    #: The saved equipment layout (``eqsLayout``), the same four slots.
+    equipment_layout: List[int] = field(default_factory=lambda: [0, 0, 0, 0])
+    #: The loaded ammunition (``shells``), flat ``[intCD, count, ...]`` pairs.
     shells: List[int] = field(default_factory=list)
-    shells_layout: Dict[int, List[int]] = field(default_factory=dict)
+    #: The ammunition layout of every ``(turret, gun)`` pair (``shellsLayout``,
+    #: keyed by the client's ``Vehicle.shellsLayoutIdx``).
+    shells_layout: Dict[Tuple[int, int], List[int]] = field(default_factory=dict)
     repair: Tuple[int, int] = (0, 0)
-    lock: int = 0
+    #: ``(lock reason, lock time)`` - ``Vehicle.isLocked`` indexes both.
+    lock: Tuple[int, int] = (0, 0)
+    #: The optional devices of the three descriptor slots, as *nation-local*
+    #: ids (``None`` = empty - device id ``0`` is a real device, the toolbox).
+    #: The client reads them out of the vehicle descriptor itself
+    #: (``VehicleDescr.optionalDevices``), so they are part of
+    #: :meth:`in_battle_descr` and not of a separate inventory section.
+    devices: List[Optional[int]] = field(default_factory=lambda: [None, None, None])
     #: The vehicle compact descriptor the client stores under
     #: ``inventory[VEHICLE]['compDescr'][invID]`` (built lazily).
     descriptor: Optional[bytes] = None
@@ -99,8 +126,32 @@ class VehicleEntry:
             configuration = dict(self.components)
             if self.turrets:
                 configuration["turrets"] = [tuple(pair) for pair in self.turrets]
-            self.descriptor = descr_module.make_compact_descr(vehicle, configuration)
+            devices = [None if value is None else int(value) for value in (self.devices or ())]
+            self.descriptor = descr_module.make_compact_descr(
+                vehicle, configuration, optional_devices=(devices + [None, None, None])[:3]
+            )
         return self.descriptor
+
+
+def _read_equipment_layout(value) -> List[int]:
+    """``eqsLayout`` is a flat list of four compact descriptors.
+
+    Older saves kept it as a mapping, so a mapping is accepted and its values
+    are flattened into slot order.
+    """
+    if isinstance(value, dict):
+        slots = [0] * 4
+        for key, values in value.items():
+            try:
+                index = int(key)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= index < len(slots):
+                slots[index] = int(values) if not isinstance(values, (list, tuple)) else int(values[0] or 0)
+        return slots
+    slots = [int(item) for item in (value or ())]
+    slots = (slots + [0, 0, 0, 0])[:4]
+    return slots
 
 
 @dataclass
@@ -112,6 +163,9 @@ class TankmanEntry:
     nation_id: int
     vehicle_inv_id: int = -1
     role: str = "commander"
+    #: The role level packed into the descriptor (50/75/100 for the three
+    #: recruitment options of ``Shop.buyTankman``).
+    role_level: int = 100
     passport: Optional[tankmen_module.Passport] = None
 
 
@@ -146,6 +200,8 @@ class AccountState:
         self.vehicles: Dict[int, VehicleEntry] = {}
         self.tankmen: Dict[int, TankmanEntry] = {}
         self.items: Dict[int, Dict[int, int]] = {}
+        #: What the last diff published per item type (see :meth:`_item_section`).
+        self._published_items: Dict[int, Dict[int, int]] = {}
         self.tokens: Dict[str, Tuple[Optional[int], int]] = {}
         self.unlocks: set = set()
         self.elite_vehicles: set = set()
@@ -219,8 +275,14 @@ class AccountState:
         """The vehicle types of the garage (``VehicleType.compact_descr``)."""
         return {entry.compact_descr for entry in self.vehicles.values()}
 
-    def add_vehicle(self, vehicle: VehicleType, crew: bool = True) -> VehicleEntry:
-        """Put one vehicle (with a stock crew) into the garage."""
+    def add_vehicle(self, vehicle: VehicleType, crew: bool = True,
+                    shells: bool = True) -> VehicleEntry:
+        """Put one vehicle (with a stock crew) into the garage.
+
+        ``shells`` follows ``BUY_VEHICLE_FLAG.SHELLS``: a vehicle bought without
+        the flag arrives empty, one bought with it carries the default
+        ammunition of its stock gun (which the buyer paid for).
+        """
         inv_id = self._next_vehicle_inv_id()
         entry = VehicleEntry(
             inv_id=inv_id,
@@ -234,12 +296,60 @@ class AccountState:
             turrets=list(vehicle.stock_configuration().get("turrets", ())),
         )
         entry.components.pop("turrets", None)
+        if shells:
+            self.load_default_ammo(entry, vehicle)
         if crew and self.tankman_factory is not None:
             entry.crew = self._create_crew(entry)
         self.vehicles[inv_id] = entry
         self.unlocks.add(vehicle.compact_descr)
         self.elite_vehicles.add(vehicle.compact_descr)
         return entry
+
+    def load_default_ammo(self, entry: VehicleEntry, vehicle: VehicleType = None) -> int:
+        """Load the stock gun's default ammunition into a new vehicle.
+
+        The client falls back to ``gun.defaultAmmo`` only when the server sends
+        no layout at all (``Vehicle._parseShells``), so the local server sends
+        the same numbers itself: a freshly granted or bought vehicle carries the
+        shells its own ``guns.xml`` prescribes.
+        """
+        vehicle = vehicle or self._vehicle_type(entry)
+        if vehicle is None:
+            return 0
+        turret, gun = self.stock_gun(entry, vehicle)
+        if turret is None or gun is None:
+            return 0
+        ammo = self.catalog.vehicles.default_ammo(vehicle, gun.id)
+        if not ammo:
+            return 0
+        entry.shells = list(ammo)
+        entry.shells_layout[catalog_module.layout_key(turret.compact_descr, gun.compact_descr)] = list(ammo)
+        return len(ammo) // 2
+
+    @staticmethod
+    def stock_gun_for(vehicle: VehicleType):
+        """The stock ``(turret, gun)`` of a vehicle *type* (no entry needed)."""
+        group = vehicle.turrets[0] if vehicle.turrets else None
+        if group is None:
+            return None, None
+        return group.turret, (group.guns[0] if group.guns else None)
+
+    @staticmethod
+    def stock_gun(entry: VehicleEntry, vehicle: VehicleType):
+        """The ``(turret, gun)`` components a vehicle's descriptor carries now."""
+        pair = entry.turrets[0] if entry.turrets else None
+        if pair is None:
+            group = vehicle.turrets[0] if vehicle.turrets else None
+            if group is None:
+                return None, None
+            return group.turret, (group.guns[0] if group.guns else None)
+        turret_id, gun_id = int(pair[0]), int(pair[1])
+        group = vehicle.find_turret_group(turret_id)
+        turret = group.turret if group is not None else None
+        gun = vehicle.find_gun(gun_id)
+        if gun is None and group is not None and group.guns:
+            gun = group.guns[0]
+        return turret, gun
 
     def _create_crew(self, entry: VehicleEntry) -> List[int]:
         """A stock crew (100% role) for a vehicle.
@@ -252,13 +362,18 @@ class AccountState:
         crew = []
         for role in self.crew_roles_of(entry):
             tankman = self.recruit_tankman(entry.nation_id, entry.innation_id, role, entry.inv_id)
-            if tankman is not None:
-                crew.append(tankman.inv_id)
+            # A seat without a crew member stays in the list as ``None``: the
+            # client indexes the crew by slot.
+            crew.append(tankman.inv_id if tankman is not None else None)
         return crew
 
     def crew_roles_of(self, entry: VehicleEntry) -> List[str]:
         """The role of every crew slot of a vehicle, in slot order."""
-        vehicle = self._vehicle_type(entry)
+        return self.crew_roles_of_type(self._vehicle_type(entry))
+
+    @staticmethod
+    def crew_roles_of_type(vehicle: Optional[VehicleType]) -> List[str]:
+        """The role of every crew slot of a vehicle type, in slot order."""
         slots = tuple(vehicle.crew_roles) if vehicle is not None else ()
         if not slots:
             slots = (("commander",), ("driver",), ("gunner",), ("loader",), ("radioman",))
@@ -271,6 +386,7 @@ class AccountState:
         role: str,
         vehicle_inv_id: int = -1,
         female: bool = False,
+        role_level: int = 100,
     ) -> Optional[TankmanEntry]:
         """Create a crew member and add it to the barracks."""
         if self.tankman_factory is None:
@@ -281,7 +397,7 @@ class AccountState:
             else:
                 passport = self.tankman_factory.make_passport(nation_id, role=role)
             compact = self.tankman_factory.make_tankman_descr(
-                passport, vehicle_innation_id, role, role_level=100
+                passport, vehicle_innation_id, role, role_level=int(role_level)
             )
         except Exception:
             return None
@@ -292,6 +408,7 @@ class AccountState:
             nation_id=nation_id,
             vehicle_inv_id=vehicle_inv_id,
             role=role,
+            role_level=int(role_level),
             passport=passport,
         )
         self.tankmen[inv_id] = entry
@@ -333,15 +450,17 @@ class AccountState:
         inventory: Dict[int, dict] = {VEHICLE: {}, TANKMAN: {}}
         vehicles = inventory[VEHICLE]
         vehicles["compDescr"] = self._vehicle_descrs()
-        vehicles["crew"] = {entry.inv_id: {tman_id: None for tman_id in entry.crew}
-                            for entry in self.vehicles.values()}
+        # ``crew`` is one *list* per vehicle, indexed by crew slot: the client
+        # walks it slot by slot and reads ``None`` as an empty seat
+        # (``Vehicle._buildCrew``), so a mapping would lose the slot order.
+        vehicles["crew"] = {entry.inv_id: list(entry.crew) for entry in self.vehicles.values()}
         vehicles["settings"] = {entry.inv_id: entry.settings for entry in self.vehicles.values()}
         vehicles["eqs"] = {entry.inv_id: list(entry.equipment) for entry in self.vehicles.values()}
-        vehicles["eqsLayout"] = {entry.inv_id: dict(entry.equipment_layout) for entry in self.vehicles.values()}
+        vehicles["eqsLayout"] = {entry.inv_id: list(entry.equipment_layout) for entry in self.vehicles.values()}
         vehicles["shells"] = {entry.inv_id: list(entry.shells) for entry in self.vehicles.values()}
         vehicles["shellsLayout"] = {entry.inv_id: dict(entry.shells_layout) for entry in self.vehicles.values()}
         vehicles["repair"] = {entry.inv_id: tuple(entry.repair) for entry in self.vehicles.values()}
-        vehicles["lock"] = {entry.inv_id: entry.lock for entry in self.vehicles.values()}
+        vehicles["lock"] = {entry.inv_id: tuple(entry.lock) for entry in self.vehicles.values()}
 
         inventory[TANKMAN].update(self.tankman_inventory_diff())
 
@@ -414,6 +533,10 @@ class AccountState:
         """
         self.revision += 1
         self.sync_tokens()
+        # A full sync replaces the client's caches, so every item travels again
+        # and the delta memory starts from what was just published.
+        self._published_items = {item_type: dict(values)
+                                 for item_type, values in self.items.items() if values}
         self.events.set_new_year_state(self.new_year.state.state)
         return {
             "rev": self.revision,
@@ -509,17 +632,28 @@ class AccountState:
         return max(0, remaining)
 
     def _vehicle_sections(self, entry: "VehicleEntry") -> Dict[str, dict]:
-        """Every ``inventory[1]`` section of one vehicle, keyed by its invID."""
+        """Every ``inventory[1]`` section of one vehicle, keyed by its invID.
+
+        The shapes are the ones the client's own ``InventoryRequester`` and
+        ``Vehicle`` read: ``crew`` a *list* with one entry per crew slot (a
+        ``None`` is an empty seat), ``eqs``/``eqsLayout`` flat lists of the four
+        equipment slots, ``shells``/``shellsLayout`` the pair encoded layouts and
+        ``lock``/``repair`` two-tuples.
+        """
         inv_id = entry.inv_id
         sections = {
-            "crew": {inv_id: {tman_id: None for tman_id in entry.crew}},
+            "crew": {inv_id: [int(tman_id) if tman_id else None for tman_id in entry.crew]},
             "settings": {inv_id: entry.settings},
-            "eqs": {inv_id: list(entry.equipment)},
-            "eqsLayout": {inv_id: dict(entry.equipment_layout)},
+            # ``VehicleEquipment`` builds a fixed-size container out of these
+            # lists (``_VehicleConsumables`` asserts the length), so both are
+            # padded to the four slots of a regular layout.
+            "eqs": {inv_id: _pad_slots(entry.equipment, EQUIPMENT_LAYOUT_SIZE)},
+            "eqsLayout": {inv_id: _pad_slots(entry.equipment_layout,
+                                             EQUIPMENT_LAYOUT_SIZE)},
             "shells": {inv_id: list(entry.shells)},
             "shellsLayout": {inv_id: dict(entry.shells_layout)},
             "repair": {inv_id: tuple(entry.repair)},
-            "lock": {inv_id: entry.lock},
+            "lock": {inv_id: tuple(entry.lock)},
         }
         vehicle = self._vehicle_type(entry)
         if vehicle is not None:
@@ -560,8 +694,26 @@ class AccountState:
             tankmen.setdefault("vehicle", {})[inv_id] = entry.vehicle_inv_id
         for item_type in item_types:
             item_type = int(item_type)
-            inventory[item_type] = dict(self.items.get(item_type, {}))
+            inventory[item_type] = self._item_section(item_type)
         return inventory
+
+    def _item_section(self, item_type: int) -> Dict[int, int]:
+        """The depot delta of one item type, ``0`` for what is gone.
+
+        The client's ``InventoryRequester`` merges the sections it receives into
+        its cache key by key (``synchronizeDicts``/``update``), so an item that
+        is no longer in the depot has to travel as an explicit ``0``: leaving the
+        key out would keep the old count in the client and its panels would offer
+        a shell the account does not own any more.
+        """
+        item_type = int(item_type)
+        current = dict(self.items.get(item_type) or {})
+        published = self._published_items.get(item_type) or {}
+        section: Dict[int, int] = {cd: count for cd, count in current.items()
+                                   if published.get(cd) != count}
+        section.update({cd: 0 for cd in published if cd not in current})
+        self._published_items[item_type] = {cd: count for cd, count in current.items() if count}
+        return section
 
     def economics_diff(self) -> dict:
         """The wallet, in the section the client's ``Stats`` reads."""
@@ -743,11 +895,16 @@ class AccountState:
                     "crew": list(entry.crew),
                     "settings": entry.settings,
                     "equipment": list(entry.equipment),
-                    "equipmentLayout": {str(k): list(v) for k, v in entry.equipment_layout.items()},
+                    "equipmentLayout": list(entry.equipment_layout),
                     "shells": list(entry.shells),
-                    "shellsLayout": {str(k): list(v) for k, v in entry.shells_layout.items()},
+                    # A layout is keyed by the ``(turret, gun)`` pair, which JSON
+                    # cannot use as a key; ``"turret:gun"`` is the encoding
+                    # ``parse_layout_key`` reads back.
+                    "shellsLayout": {"%d:%d" % key: list(value)
+                                     for key, value in entry.shells_layout.items()},
                     "repair": list(entry.repair),
-                    "lock": entry.lock,
+                    "lock": list(entry.lock),
+                    "devices": list(entry.devices),
                 }
                 for inv_id, entry in sorted(self.vehicles.items())
             },
@@ -755,6 +912,7 @@ class AccountState:
                 str(inv_id): {
                     "nationID": entry.nation_id,
                     "role": entry.role,
+                    "roleLevel": entry.role_level,
                     "vehicleInvID": entry.vehicle_inv_id,
                     # Compact descriptors are bytes; keep them readable in JSON.
                     "compactDescr": entry.compact_descr.decode("latin-1"),
@@ -799,18 +957,20 @@ class AccountState:
                 tags=tuple(data.get("tags", ())),
                 components={key: int(value) for key, value in data.get("components", {}).items()},
                 turrets=[tuple(pair) for pair in data.get("turrets", ())],
-                crew=[int(tman) for tman in data.get("crew", ())],
+                crew=[None if tman is None else int(tman)
+                      for tman in data.get("crew", ())],
                 settings=int(data.get("settings", 0)),
-                equipment=[int(value) for value in data.get("equipment", (0, 0, 0))],
-                equipment_layout={
-                    int(key): [int(v) for v in value] for key, value in data.get("equipmentLayout", {}).items()
-                },
+                equipment=[int(value) for value in data.get("equipment", (0, 0, 0, 0))],
+                equipment_layout=_read_equipment_layout(data.get("equipmentLayout")),
                 shells=[int(value) for value in data.get("shells", ())],
                 shells_layout={
-                    int(key): [int(v) for v in value] for key, value in data.get("shellsLayout", {}).items()
+                    catalog_module.parse_layout_key(key): [int(v) for v in value]
+                    for key, value in (data.get("shellsLayout") or {}).items()
                 },
                 repair=tuple(data.get("repair", (0, 0))),
-                lock=int(data.get("lock", 0)),
+                lock=tuple(data.get("lock", (0, 0))),
+                devices=[None if value is None else int(value)
+                         for value in data.get("devices", (None, None, None))],
             )
             state.vehicles[entry.inv_id] = entry
         for inv_id, data in (payload.get("tankmen") or {}).items():
@@ -819,6 +979,7 @@ class AccountState:
                 compact_descr=str(data["compactDescr"]).encode("latin-1"),
                 nation_id=int(data.get("nationID", 0)),
                 role=data.get("role", "commander"),
+                role_level=int(data.get("roleLevel", 100)),
                 vehicle_inv_id=int(data.get("vehicleInvID", -1)),
             )
             state.tankmen[entry.inv_id] = entry
@@ -828,6 +989,8 @@ class AccountState:
             int(item_type): {int(cd): int(count) for cd, count in values.items()}
             for item_type, values in (payload.get("items") or {}).items()
         }
+        state._published_items = {item_type: dict(values)
+                                  for item_type, values in state.items.items() if values}
         state.new_year.state = ny_module.NewYearState.from_json(payload.get("newYear") or {}, catalog.new_year)
         state.new_year.tankmen = tankman_factory
         state.sync_tokens()

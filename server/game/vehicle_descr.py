@@ -76,7 +76,11 @@ def make_compact_descr(
     flags = 0
     devices = b""
     for index, device_id in enumerate(optional_devices or ()):
-        if index >= OPTIONAL_DEVICE_SLOTS or not device_id:
+        # An empty slot is ``None`` (or a plain ``0`` for callers that build the
+        # list from XML ids): the *flags* byte is what marks a mounted device,
+        # and device id ``0`` is a real device (the toolbox), so the two must
+        # not be confused.
+        if index >= OPTIONAL_DEVICE_SLOTS or device_id is None or device_id == "":
             continue
         flags |= 1 << index
         devices += struct.pack("<H", int(device_id))

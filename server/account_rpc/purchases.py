@@ -136,11 +136,18 @@ class Shopkeeper(object):
         return credits * max(0, int(count))
 
     def _charge(self, credits: int = 0, gold: int = 0) -> None:
+        """Take the price: every currency the price names has to be there.
+
+        A vehicle is priced in one currency, but the crew and the ammunition a
+        purchase may include are priced separately, so a single purchase can
+        cost credits *and* gold (the client's ``MoneyValidator`` checks the
+        wallet the same way, per currency).
+        """
         state = self.state
         if credits > state.credits or gold > state.gold:
             raise PurchaseError(-1, "NOT_ENOUGH_MONEY")
-        state.credits -= credits
-        state.gold -= gold
+        state.credits -= int(credits)
+        state.gold -= int(gold)
 
     def _pay(self, credits: int) -> None:
         self.state.credits += max(0, int(credits))
@@ -164,21 +171,35 @@ class Shopkeeper(object):
         if compact_descr in state.owned_vehicle_comp_descrs():
             raise PurchaseError(-1, "ALREADY_BOUGHT")
         crew = bool(flags & BUY_VEHICLE_FLAG_CREW)
-        credits, gold = vehicle.price_credits, vehicle.price_gold
-        crew_cost = self._crew_cost(tman_cost_type_index) if crew else (0, 0)
-        credits += crew_cost[0]
-        gold += crew_cost[1]
-        if gold > 0:
-            self._charge(gold=gold)
-        else:
-            self._charge(credits=credits)
-        entry = state.add_vehicle(vehicle, crew=crew)
+        shells = bool(flags & BUY_VEHICLE_FLAG_SHELLS)
+        credits, gold = int(vehicle.price_credits), int(vehicle.price_gold)
+        if crew:
+            members = len(state.crew_roles_of_type(vehicle))
+            crew_credits, crew_gold = self.crew_cost(tman_cost_type_index)
+            credits += crew_credits * members
+            gold += crew_gold * members
+        if shells:
+            ammo_credits, ammo_gold = self.ammo_cost(vehicle, self._default_ammo(vehicle))
+            credits += ammo_credits
+            gold += ammo_gold
+        self._charge(credits=credits, gold=gold)
+        entry = state.add_vehicle(vehicle, crew=crew, shells=shells)
         return {
             "code": 0,
             "ext": {"vehInvID": entry.inv_id},
             "diff": self.purchase_diff(vehicle_inv_ids=[entry.inv_id],
-                                       tankman_inv_ids=entry.crew),
+                                       tankman_inv_ids=[t for t in entry.crew if t]),
         }
+
+    def _default_ammo(self, vehicle) -> list:
+        """The stock ammunition of a vehicle type (empty when it is unknown)."""
+        try:
+            turret, gun = self.state.stock_gun_for(vehicle)
+        except Exception:  # pragma: no cover - a broken catalogue never bills
+            return []
+        if turret is None or gun is None:
+            return []
+        return self.state.catalog.vehicles.default_ammo(vehicle, gun.id)
 
     def buy_item(self, compact_descr: int, count: int, gold_for_credits: bool = False) -> dict:
         """``CMD_BUY_ITEM``: shells, equipment, consumables, optional devices."""
@@ -214,17 +235,22 @@ class Shopkeeper(object):
         role = ROLE_BY_INDEX.get(int(role_index))
         if role is None:
             raise PurchaseError(-2, "INVALID_CREW_REQUEST")
-        credits, gold = self._crew_cost(tman_cost_type_index)
+        credits, gold = self.crew_cost(tman_cost_type_index)
         if gold > 0:
             self._charge(gold=gold)
-        else:
+        elif credits > 0:
             self._charge(credits=credits)
-        tankman = state.recruit_tankman(vehicle.nation_id, vehicle.innation_id, role)
+        tankman = state.recruit_tankman(
+            vehicle.nation_id, vehicle.innation_id, role,
+            role_level=self.crew_role_level(tman_cost_type_index),
+        )
         if tankman is None:
             raise PurchaseError(-1, "CANNOT_RECRUIT")
         return {
             "code": 0,
-            "ext": {"tmanInvID": tankman.inv_id},
+            # ``Shop.buyTankman`` reads both keys out of the ext
+            # (``ext.get('tmanInvID')`` / ``ext.get('tmanCompDescr')``).
+            "ext": {"tmanInvID": tankman.inv_id, "tmanCompDescr": tankman.compact_descr},
             "diff": self.purchase_diff(tankman_inv_ids=[tankman.inv_id]),
         }
 
@@ -240,14 +266,47 @@ class Shopkeeper(object):
         self.state.berths += BERTH_PACK_SIZE * BERTHS_PER_COMMAND
         return {"code": 0, "ext": None, "diff": self.purchase_diff(stats=True)}
 
-    def _crew_cost(self, tman_cost_type_index: int) -> Price:
-        """What the chosen recruitment option costs; the table is the shop's own."""
+    def _crew_option(self, tman_cost_type_index: int) -> dict:
         table = self.shop.payload().get("tankmanCost") or shop_module.TANKMAN_COST
         index = int(tman_cost_type_index)
         if index < 0 or index >= len(table):
-            return 0, 0
-        option = table[index]
+            return {}
+        return dict(table[index] or {})
+
+    def crew_cost(self, tman_cost_type_index: int) -> Price:
+        """What the chosen recruitment option costs; the table is the shop's own."""
+        option = self._crew_option(tman_cost_type_index)
         return int(option.get("credits", 0) or 0), int(option.get("gold", 0) or 0)
+
+    def crew_role_level(self, tman_cost_type_index: int) -> int:
+        """The role level the recruited crew member is packed with.
+
+        ``Shop.buyTankman`` offers three options (``tankmanCost``); the client
+        shows ``roleLevel`` (50/75/100) in the recruiter window, so the
+        descriptor the account hands out carries the same number.
+        """
+        option = self._crew_option(tman_cost_type_index)
+        return int(option.get("roleLevel", 100) or 100)
+
+    def _crew_cost(self, tman_cost_type_index: int) -> Price:
+        return self.crew_cost(tman_cost_type_index)
+
+    def ammo_cost(self, vehicle, ammo) -> Price:
+        """What the default ammunition of a gun costs (credits, gold).
+
+        ``getCrewAndShellsSumPrice`` of the client charges
+        ``shell.buyPrices.itemPrice.price * shell.defaultCount`` for every shell
+        of ``vehicle.gun.defaultAmmo``, so the local server charges the same.
+        """
+        credits = gold = 0
+        for index in range(0, len(ammo) - 1, 2):
+            compact, count = int(ammo[index]), int(ammo[index + 1])
+            if count <= 0:
+                continue
+            price = self.state.price_of(compact) or (0, 0)
+            credits += max(0, int(price[0])) * count
+            gold += max(0, int(price[1])) * count
+        return credits, gold
 
     # -- selling --------------------------------------------------------
     def sell_vehicle(self, inv_id: int, dismiss_crew: bool = False,
@@ -261,7 +320,7 @@ class Shopkeeper(object):
         refund = self.sell_value(entry.compact_descr, VEHICLE_TYPE)
         removed_tankmen = []
         if dismiss_crew:
-            removed_tankmen = list(entry.crew)
+            removed_tankmen = [tankman_id for tankman_id in entry.crew if tankman_id]
             for tankman_id in removed_tankmen:
                 state.tankmen.pop(tankman_id, None)
         for compact_descr in list(items_from_vehicle) + list(items_from_inventory):

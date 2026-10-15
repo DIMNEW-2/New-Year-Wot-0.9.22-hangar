@@ -414,13 +414,19 @@ class Component:
     level: int = 0
     unlocks: List[Tuple[str, str, int]] = field(default_factory=list)  # (group, name, cost)
     shared: bool = True
+    #: Ammunition of a gun (``<maxAmmo>``, ``<clip><count>`` and ``<shots>`` of
+    #: the nation's ``guns.xml``): the client fills a vehicle's ammunition from
+    #: the gun's own shots, so the local server reads the same numbers.
+    max_ammo: int = 0
+    clip_size: int = 1
+    shots: List[Tuple[str, float]] = field(default_factory=list)  # (shell name, defaultPortion)
 
     @property
     def compact_descr(self) -> int:
         return items_module.make_int_compact_descr_by_id(self.type_name, self.nation_id, self.id)
 
     def as_json(self) -> dict:
-        return {
+        payload = {
             "name": self.name,
             "id": self.id,
             "price": self.price_credits,
@@ -428,6 +434,11 @@ class Component:
             "level": self.level,
             "unlocks": [[group, name, cost] for group, name, cost in self.unlocks],
         }
+        if self.max_ammo:
+            payload["maxAmmo"] = self.max_ammo
+            payload["clipSize"] = self.clip_size
+            payload["shots"] = [[name, portion] for name, portion in self.shots]
+        return payload
 
     @classmethod
     def from_json(cls, type_name: str, payload: dict) -> "Component":
@@ -440,6 +451,9 @@ class Component:
             price_gold=int(payload.get("priceGold", 0)),
             level=int(payload.get("level", 0)),
             unlocks=[(group, name, int(cost)) for group, name, cost in payload.get("unlocks", ())],
+            max_ammo=int(payload.get("maxAmmo", 0)),
+            clip_size=int(payload.get("clipSize", 1)) or 1,
+            shots=[(str(name), float(portion)) for name, portion in payload.get("shots", ())],
         )
 
 
@@ -601,6 +615,23 @@ class VehicleType:
                 return group
         return None
 
+    def turret_position(self, turret_id: int) -> Optional[int]:
+        """The ``turretsN`` position of a turret of this vehicle."""
+        group = self.find_turret_group(turret_id)
+        return None if group is None else group.position
+
+    def gun_fits_turret(self, gun_id: int, turret_id: int) -> bool:
+        """``True`` when a gun is one of the turret's own alternatives.
+
+        This is the check ``VehicleDescr.mayInstallComponent`` performs in the
+        client before it sends ``CMD_EQUIP``: a gun only fits the turrets that
+        list it in their ``<guns>`` section.
+        """
+        group = self.find_turret_group(turret_id)
+        if group is None:
+            return False
+        return any(gun.id == gun_id for gun in group.guns)
+
     def as_json(self) -> dict:
         return {
             "name": self.name,
@@ -660,6 +691,27 @@ class VehicleType:
         )
 
 
+#: ``shellsLayout`` is keyed by ``(turret compact descriptor, gun compact
+#: descriptor)`` - the client's own ``Vehicle.shellsLayoutIdx``.
+LayoutKey = Tuple[int, int]
+
+
+def layout_key(turret_compact_descr: int, gun_compact_descr: int) -> LayoutKey:
+    return (int(turret_compact_descr), int(gun_compact_descr))
+
+
+def parse_layout_key(value) -> LayoutKey:
+    """Read back a ``shellsLayout`` key, which JSON keeps as a string."""
+    if isinstance(value, (tuple, list)):
+        return (int(value[0]), int(value[1]))
+    text = str(value).strip()
+    for separator in (":", ",", "-"):
+        if separator in text:
+            left, _sep, right = text.partition(separator)
+            return (int(left), int(right))
+    return (int(text), 0)
+
+
 def _top_component(components: Sequence[Component], group_name: str, fallback: Optional[Component] = None):
     """The last component of a research chain (a component unlocking nothing else).
 
@@ -684,7 +736,9 @@ def _top_component(components: Sequence[Component], group_name: str, fallback: O
 
 
 class VehicleCatalog:
-    def __init__(self, vehicles: Dict[int, VehicleType], extra_prices: Dict[int, Tuple[int, int]] = None):
+    def __init__(self, vehicles: Dict[int, VehicleType], extra_prices: Dict[int, Tuple[int, int]] = None,
+                 shells: Dict[int, Dict[str, Component]] = None,
+                 devices: Dict[int, dict] = None):
         self.vehicles = dict(vehicles)
         self.by_name: Dict[str, VehicleType] = {vehicle.name: vehicle for vehicle in self.vehicles.values()}
         #: ``compactDescr -> (credits, gold)`` of the items that do not belong to
@@ -692,12 +746,49 @@ class VehicleCatalog:
         #: devices (both ``nations.NONE_INDEX``).  The shop sends these prices
         #: with its cache, and the depot/buy dialogs read them from there.
         self.extra_prices: Dict[int, Tuple[int, int]] = dict(extra_prices or {})
+        #: ``nationID -> {shell name: Component}`` - the table that turns a gun's
+        #: ``<shots>`` into compact descriptors (see :meth:`default_ammo`).
+        self.shells: Dict[int, Dict[str, Component]] = {
+            int(nation_id): dict(table) for nation_id, table in (shells or {}).items()
+        }
+        #: ``compactDescr -> metadata`` of every optional device of
+        #: ``optional_devices.xml`` (its tags, whether it can be taken off for
+        #: free and the vehicle tags it is allowed/forbidden on).
+        self.devices: Dict[int, dict] = {int(cd): dict(meta) for cd, meta in (devices or {}).items()}
 
     def get(self, compact_descr: int) -> Optional[VehicleType]:
         return self.vehicles.get(compact_descr)
 
     def get_by_name(self, name: str) -> Optional[VehicleType]:
         return self.by_name.get(name)
+
+    def shell(self, nation_id: int, name: str) -> Optional[Component]:
+        """The shell a gun's ``<shots>`` entry points at."""
+        return (self.shells.get(int(nation_id)) or {}).get(name)
+
+    def default_ammo(self, vehicle: VehicleType, gun_id: int) -> List[int]:
+        """The default ammunition of one gun as flat ``[intCD, count, ...]``.
+
+        Mirrors ``common/items/vehicles.getDefaultAmmoForGun``: every shot of
+        the gun gets ``int(portion * maxAmmo / clipSize + 0.5) * clipSize``
+        shells, the last one only what is left of ``maxAmmo``.
+        """
+        gun = vehicle.find_gun(gun_id)
+        if gun is None or not gun.shots or gun.max_ammo <= 0:
+            return []
+        clip = max(1, int(gun.clip_size or 1))
+        ammo: List[int] = []
+        taken = 0
+        for name, portion in gun.shots:
+            shell = self.shell(vehicle.nation_id, name)
+            if shell is None:
+                continue
+            count = int(portion * gun.max_ammo / clip + 0.5) * clip
+            if taken + count > gun.max_ammo:
+                count = gun.max_ammo - taken
+            taken += count
+            ammo.extend((shell.compact_descr, max(0, count)))
+        return ammo
 
     def all(self) -> List[VehicleType]:
         return sorted(self.vehicles.values(), key=lambda vehicle: (vehicle.nation_id, vehicle.innation_id))
@@ -742,6 +833,11 @@ class VehicleCatalog:
             "vehicles": [vehicle.as_json() for vehicle in self.all()],
             "extraPrices": [[compact, price[0], price[1]]
                             for compact, price in sorted(self.extra_prices.items())],
+            "shells": [
+                [nation_id, [[name, shell.as_json()] for name, shell in sorted(table.items())]]
+                for nation_id, table in sorted(self.shells.items())
+            ],
+            "devices": [[compact, meta] for compact, meta in sorted(self.devices.items())],
         }
 
     @classmethod
@@ -752,7 +848,12 @@ class VehicleCatalog:
             vehicles[vehicle.compact_descr] = vehicle
         extra = {int(compact): (int(credits), int(gold))
                  for compact, credits, gold in payload.get("extraPrices", ())}
-        return cls(vehicles, extra)
+        shells = {
+            int(nation_id): {name: Component.from_json("shell", raw) for name, raw in entries}
+            for nation_id, entries in payload.get("shells", ())
+        }
+        devices = {int(compact): dict(meta) for compact, meta in payload.get("devices", ())}
+        return cls(vehicles, extra, shells, devices)
 
 
 # --------------------------------------------------------------------------
@@ -764,6 +865,11 @@ class Catalog:
         self.vehicles = vehicles
         self.meta = meta or {}
 
+    @property
+    def devices(self) -> Dict[int, dict]:
+        """The optional devices the installation describes."""
+        return self.vehicles.devices
+
     def validate(self):
         self.new_year.validate()
 
@@ -774,6 +880,9 @@ class Catalog:
             "clientBuild": self.meta.get("clientBuild", "0.9.22.0.1 #1513"),
             "newYear": self.new_year.to_json(),
             "vehicles": self.vehicles.to_json()["vehicles"],
+            "extraPrices": self.vehicles.to_json()["extraPrices"],
+            "shells": self.vehicles.to_json()["shells"],
+            "devices": self.vehicles.to_json()["devices"],
         }
         return payload
 
@@ -782,7 +891,14 @@ class Catalog:
         if int(payload.get("schema", 0)) != 1:
             raise CatalogError("unsupported catalog schema: %r" % (payload.get("schema"),))
         new_year = NyCatalog.from_json(payload["newYear"])
-        vehicles = VehicleCatalog.from_json({"vehicles": payload["vehicles"]})
+        vehicles = VehicleCatalog.from_json(
+            {
+                "vehicles": payload["vehicles"],
+                "extraPrices": payload.get("extraPrices", ()),
+                "shells": payload.get("shells", ()),
+                "devices": payload.get("devices", ()),
+            }
+        )
         return cls(new_year, vehicles, payload)
 
     @classmethod
@@ -846,7 +962,103 @@ def _parse_component_file(section, group_name: str, nation_id: int) -> Dict[str,
             component.price_gold = price if currency == "gold" else 0
             component.level = entry.value_int("level", 0)
             component.unlocks = _read_unlocks(entry)
+            if group_name == "gun":
+                _read_gun_ammo(entry, component)
     return components
+
+
+def _read_gun_ammo(section, gun: Component) -> None:
+    """The ``<maxAmmo>``/``<clip>``/``<shots>`` of one gun of ``guns.xml``.
+
+    ``common/items/vehicles.getDefaultAmmoForGun`` turns exactly these numbers
+    into the default ammunition of a gun, which is what the client shows (and
+    sends back in ``CMD_SET_AND_FILL_LAYOUTS``) for a vehicle whose layout the
+    server has not customized yet.
+    """
+    gun.max_ammo = section.value_int("maxAmmo", 0)
+    clip = section.subsection("clip")
+    gun.clip_size = max(1, clip.value_int("count", 1)) if clip is not None else 1
+    shots = section.subsection("shots")
+    if shots is None:
+        return
+    gun.shots = [(shot.name, shot.value_float("defaultPortion", 1.0)) for shot in shots.children]
+
+
+def _parse_devices(source: DefsSource) -> Dict[int, dict]:
+    """The optional devices of ``vehicles/common/optional_devices.xml``.
+
+    Only what the local server has to check is kept: the device's own ``<tags>``,
+    whether it can be taken off without paying (``<removable>`` defaults to
+    ``false`` in the client's own reader), the tags it cannot live with
+    (``<incompatibleTags><installed>``) and the vehicle tags its
+    ``<vehicleFilter>`` includes or excludes.
+    """
+    from .items import make_int_compact_descr_by_id
+
+    path = "vehicles/common/optional_devices.xml"
+    devices: Dict[int, dict] = {}
+    if not source.has(path):
+        return devices
+    for entry in source.read_section(path).children:
+        if entry.name in ("ids", "shared", "icons"):
+            continue
+        device_id = entry.value_int("id", -1)
+        if device_id < 0:
+            continue
+        incompatible = entry.subsection("incompatibleTags")
+        include_tags: List[str] = []
+        exclude_tags: List[str] = []
+        vehicle_filter = entry.subsection("vehicleFilter")
+        if vehicle_filter is not None:
+            for side, target in (("include", include_tags), ("exclude", exclude_tags)):
+                side_section = vehicle_filter.subsection(side)
+                if side_section is None:
+                    continue
+                for vehicle_section in side_section.subsections("vehicle"):
+                    target.extend(vehicle_section.value_tokens("tags"))
+        try:
+            compact = make_int_compact_descr_by_id("optionalDevice", 15, device_id)
+        except ValueError:
+            continue
+        devices[compact] = {
+            "id": device_id,
+            "tags": entry.value_tokens("tags"),
+            "removable": entry.value_bool("removable", False),
+            "incompatibleTags": incompatible.value_tokens("installed") if incompatible is not None else [],
+            "includeTags": include_tags,
+            "excludeTags": exclude_tags,
+        }
+    return devices
+
+
+def _parse_shells(source: DefsSource, nation: str, nation_id: int) -> Dict[str, Component]:
+    """``name -> shell`` of one nation's ``components/shells.xml``.
+
+    Unlike the other component files, the shells are written as top level
+    sections (``<_7.92mm_AP><id>96</id><price>3</price>...</_7.92mm_AP>``), so
+    they need their own reader.  The name table is what links a gun's
+    ``<shots>`` to a compact descriptor.
+    """
+    path = "vehicles/%s/components/shells.xml" % nation
+    shells: Dict[str, Component] = {}
+    if not source.has(path):
+        return shells
+    for entry in source.read_section(path).children:
+        if entry.name in ("ids", "shared", "icons"):
+            continue
+        shell_id = entry.value_int("id", -1)
+        if shell_id < 0:
+            continue
+        price, currency = _read_price(entry)
+        shells[entry.name] = Component(
+            type_name="shell",
+            name=entry.name,
+            id=shell_id,
+            nation_id=nation_id,
+            price_credits=price if currency == "credits" else 0,
+            price_gold=price if currency == "gold" else 0,
+        )
+    return shells
 
 
 def _read_unlocks(section) -> List[Tuple[str, str, int]]:
@@ -958,8 +1170,10 @@ def _parse_extra_prices(source: DefsSource, nations: Sequence[str]) -> Dict[int,
 
 def load_vehicle_catalog(source: DefsSource, nations: Sequence[str] = nyc.NATIONS) -> VehicleCatalog:
     vehicles: Dict[int, VehicleType] = {}
+    shells: Dict[int, Dict[str, Component]] = {}
     for nation in nations:
         nation_id = nyc.NATION_INDICES[nation]
+        shells[nation_id] = _parse_shells(source, nation, nation_id)
         components: Dict[str, Dict[str, Component]] = {}
         for group_name, pattern in COMPONENT_GROUP_FILES.items():
             path = pattern % nation
@@ -994,7 +1208,7 @@ def load_vehicle_catalog(source: DefsSource, nations: Sequence[str] = nyc.NATION
             if vehicle_path is not None:
                 _apply_vehicle_xml(vehicle, source.read_section(vehicle_path), components)
             vehicles[vehicle.compact_descr] = vehicle
-    return VehicleCatalog(vehicles, _parse_extra_prices(source, nations))
+    return VehicleCatalog(vehicles, _parse_extra_prices(source, nations), shells, _parse_devices(source))
 
 
 _VEHICLE_FILE_INDEX: Dict[str, Dict[str, str]] = {}
@@ -1119,6 +1333,7 @@ __all__ = [
     "Catalog",
     "CatalogError",
     "Component",
+    "LayoutKey",
     "NyBox",
     "NyCatalog",
     "NyChest",
@@ -1130,6 +1345,8 @@ __all__ = [
     "TurretGroup",
     "VehicleCatalog",
     "VehicleType",
+    "layout_key",
     "load_ny_catalog",
     "load_vehicle_catalog",
+    "parse_layout_key",
 ]

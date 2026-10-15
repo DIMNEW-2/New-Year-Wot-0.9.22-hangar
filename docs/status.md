@@ -19,6 +19,17 @@ What works today, and what is still missing or unverified.
   `item_defs`), buying and selling vehicles and items, garage slots and barracks
   berths.  Prices, refunds and refusals match what the client's own dialogs
   show (`Shop.getSellPrice`, `ShopCommonStats`).
+* **The garage** — mounting modules (`CMD_EQUIP`, a turret carries its gun),
+  optional devices (`CMD_EQUIP_OPTDEV`, including the paid removal of a
+  `<removable>false</removable>` device and the `incompatibleTags` filters),
+  ammunition (`CMD_EQUIP_SHELLS`, `CMD_SET_AND_FILL_LAYOUTS`, which buys what a
+  layout is short of and answers with what was bought), consumables
+  (`CMD_EQUIP_EQS`, `CMD_SET_AND_FILL_LAYOUTS`), crew (`CMD_EQUIP_TMAN`,
+  `CMD_BUY_AND_EQUIP_TMAN`), repair (`CMD_REPAIR`), the per-vehicle settings
+  (`CMD_VEH_SETTINGS`) and buying-and-mounting in one step
+  (`CMD_BUY_AND_EQUIP_ITEM`).  Everything the client mounts leaves the depot and
+  everything it takes off goes back into it, so the counts its panels price
+  against are the counts the server charges for.
 * **Diffs the client reads** — `inventory` (vehicles with their descriptors,
   crew, equipment, shells, settings, locks; tankmen), `stats`, `account`,
   `economics`, `tokens`, `newYear`, `('goodies','_r')`,
@@ -32,9 +43,19 @@ What works today, and what is still missing or unverified.
   travels), the event action, the in-game event state and the notifications.
   The notification `cmd_change_hangar` switches the client's hangar space to
   `spaces/h07_newyear_2015` (`gui/ClientHangarSpace.py`).
+* **Depot diffs** — the `inventory` sections of shells, equipment, optional
+  devices and modules only carry what changed plus an explicit `0` for what left
+  the depot (`InventoryRequester` merges key by key, so a missing key would keep
+  a stale count in the client).
 * **Loot reports** — opening a box or a chest pushes a `tokenQuests` system
   message (chat action 21) with the rewards, exactly what
   `_NewYearBoxStorage.__handleSysMsg` expects.
+* **Garage validation** is the client's own: the local server trusts the module
+  and device ids the client sends, checks that they belong to the vehicle and
+  that they are in the depot, but it does not re-derive research trees, crew
+  role requirements of a module or gun/turret compatibility beyond
+  `mayInstallComponent`.  Fitting commands never charge for the *mount* itself -
+  only a purchase or a paid removal costs money.
 * **Wire protocol** — length-prefixed, zlib-compressed pickles that Python 2.7
   reads; framed tests of a whole session (hello → welcome → commands → diffs →
   system messages → stream) run against a real socket.
@@ -55,9 +76,7 @@ What works today, and what is still missing or unverified.
   `gui/hangars.xml` `default_hangar` is a good hint).
 * **Battles** are out of scope: no `Avatar`, no arena, no battle results.
 * **The shop** prices what `item_defs` prices; personal discounts and boosters
-  (`goodies`) beyond the New Year ones are not implemented, and the equipment/
-  consumable **purchase** flow that the client's dialog drives
-  (`CMD_BUY_AND_EQUIP_ITEM`) is accepted but only buys, it does not mount.
+  (`goodies`) beyond the New Year ones are not implemented.
 * **Goodies definitions** (`scripts/server_xml/goodies.xml`) are server-side
   data of the live game and are not in the client: the event's own variadic
   discounts work, the shop's personal discount list is empty.

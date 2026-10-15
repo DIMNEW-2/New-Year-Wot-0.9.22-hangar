@@ -17,6 +17,10 @@ arguments are taken straight from the wire, exactly as the client sent them:
 ``addToys``/``addToken``  the development helpers of the client's debug panel
 ======================  =====================================================
 
+The garage commands (``CMD_EQUIP``, ``CMD_SET_AND_FILL_LAYOUTS``, ...) are
+handled by :mod:`server.account_rpc.garage`, which keeps the depot bookkeeping
+of everything a vehicle carries in step with the client.
+
 The dispatcher answers with a response code, an optional error string, an
 optional pickled ``ext`` payload (the client picks it up in
 ``Account.onCmdResponseExt``) and the messages the bridge should push to the
@@ -33,6 +37,7 @@ from ..game import new_year as ny_module
 from ..proto import pack_stream, py2_dumps
 from . import commands as cmd
 from . import data as data_module
+from . import garage as garage_module
 from . import purchases as purchases_module
 from .state import AccountState
 
@@ -90,6 +95,7 @@ class RequestDispatcher:
         self.state = state
         self.log = logger or LOG
         self.shop = purchases_module.Shopkeeper(state)
+        self.garage = garage_module.Garage(state)
         self._message_id = 0
         self._handlers = {
             cmd.CMD_SYNC_DATA: self.on_sync_data,
@@ -101,6 +107,16 @@ class RequestDispatcher:
             cmd.CMD_SELL_ITEM: self.on_sell_item,
             cmd.CMD_BUY_SLOT: self.on_buy_slot,
             cmd.CMD_BUY_BERTHS: self.on_buy_berths,
+            cmd.CMD_BUY_AND_EQUIP_ITEM: self.on_buy_and_equip_item,
+            cmd.CMD_BUY_AND_EQUIP_TMAN: self.on_buy_and_equip_tankman,
+            cmd.CMD_EQUIP: self.on_equip,
+            cmd.CMD_EQUIP_OPTDEV: self.on_equip_opt_device,
+            cmd.CMD_EQUIP_SHELLS: self.on_equip_shells,
+            cmd.CMD_EQUIP_EQS: self.on_equip_equipments,
+            cmd.CMD_EQUIP_TMAN: self.on_equip_tankman,
+            cmd.CMD_REPAIR: self.on_repair,
+            cmd.CMD_VEH_SETTINGS: self.on_change_setting,
+            cmd.CMD_SET_AND_FILL_LAYOUTS: self.on_set_and_fill_layouts,
             cmd.CMD_REQ_SERVER_STATS: self.on_server_stats,
             cmd.CMD_NEW_YEAR_OPEN_BOX: self.on_open_box,
             cmd.CMD_NEW_YEAR_SELECT_DISCOUNT: self.on_select_discount,
@@ -119,14 +135,6 @@ class RequestDispatcher:
         self._acknowledged = {
             cmd.CMD_ADD_INT_USER_SETTINGS,
             cmd.CMD_SYNC_DOSSIERS,
-            cmd.CMD_REPAIR,
-            cmd.CMD_VEH_SETTINGS,
-            cmd.CMD_EQUIP,
-            cmd.CMD_EQUIP_OPTDEV,
-            cmd.CMD_EQUIP_SHELLS,
-            cmd.CMD_EQUIP_EQS,
-            cmd.CMD_EQUIP_TMAN,
-            cmd.CMD_SET_AND_FILL_LAYOUTS,
         }
 
     # -- entry point ----------------------------------------------------
@@ -189,7 +197,7 @@ class RequestDispatcher:
         """Run one shop operation and publish the diff it produced."""
         try:
             outcome = action(*args)
-        except purchases_module.PurchaseError as error:
+        except (purchases_module.PurchaseError, garage_module.GarageError) as error:
             self.log.info("shop: refused (%s)", error)
             return Response(code=error.code, error=error.error)
         self.log.info("shop: %s -> %s", getattr(action, "__name__", action),
@@ -237,6 +245,75 @@ class RequestDispatcher:
     def on_buy_berths(self, request_id: int, args: Sequence) -> Response:
         """``CMD_BUY_BERTHS`` - one more barracks berth pack."""
         return self._purchase(self.shop.buy_berths)
+
+    # -- the garage -----------------------------------------------------
+    def on_equip(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_EQUIP`` - ``Int3 (vehInvID, itemCompDescr, gunCompDescr)``."""
+        veh_inv_id, compact = int(args[0]), int(args[1])
+        gun = int(args[2]) if len(args) > 2 else 0
+        return self._purchase(self.garage.equip, veh_inv_id, compact, gun)
+
+    def on_equip_opt_device(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_EQUIP_OPTDEV`` - ``[shopRev, vehInvID, device, slot, isPaid]``."""
+        _revision, values = garage_module.parse_shop_revision(args)
+        if len(values) < 4:
+            return Response(code=cmd.RES_WRONG_ARGS, error=garage_module.ERROR_SERVER)
+        veh_inv_id, compact, slot = int(values[0]), int(values[1]), int(values[2])
+        paid = bool(int(values[3]))
+        return self._purchase(self.garage.equip_opt_device, veh_inv_id, compact, slot, paid)
+
+    def on_equip_shells(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_EQUIP_SHELLS`` - ``[vehInvID, *shells]``."""
+        values = list(args[0]) if args and isinstance(args[0], (list, tuple)) else list(args)
+        if len(values) < 2:
+            return Response(code=cmd.RES_WRONG_ARGS, error=garage_module.ERROR_SERVER)
+        return self._purchase(self.garage.equip_shells, int(values[0]), values[1:])
+
+    def on_equip_equipments(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_EQUIP_EQS`` - ``[vehInvID, eq1, eq2, eq3, booster]``."""
+        values = list(args[0]) if args and isinstance(args[0], (list, tuple)) else list(args)
+        if len(values) < 2:
+            return Response(code=cmd.RES_WRONG_ARGS, error=garage_module.ERROR_SERVER)
+        return self._purchase(self.garage.equip_equipments, int(values[0]), values[1:])
+
+    def on_equip_tankman(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_EQUIP_TMAN`` - ``Int3 (vehInvID, slot, tmanInvID)``."""
+        veh_inv_id, slot = int(args[0]), int(args[1])
+        tman = int(args[2]) if len(args) > 2 else -1
+        return self._purchase(self.garage.equip_tankman, veh_inv_id, slot, tman)
+
+    def on_repair(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_REPAIR`` - ``Int3 (vehInvID, 0, 0)``."""
+        return self._purchase(self.garage.repair, int(args[0]))
+
+    def on_change_setting(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_VEH_SETTINGS`` - ``Int3 (vehInvID, setting, isOn)``."""
+        veh_inv_id, setting = int(args[0]), int(args[1])
+        is_on = bool(int(args[2])) if len(args) > 2 else False
+        return self._purchase(self.garage.change_setting, veh_inv_id, setting, is_on)
+
+    def on_set_and_fill_layouts(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_SET_AND_FILL_LAYOUTS`` - save a layout and pay for what it lacks."""
+        _revision, veh_inv_id, shells, equipment_type, eqs = garage_module.parse_set_and_fill(args)
+        return self._purchase(self.garage.set_and_fill_layouts, veh_inv_id, shells,
+                              equipment_type, eqs)
+
+    def on_buy_and_equip_item(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_BUY_AND_EQUIP_ITEM`` - ``[rev, compDescr, vehInvID, slot, paid, gun]``."""
+        _revision, values = garage_module.parse_shop_revision(args)
+        if len(values) < 3:
+            return Response(code=cmd.RES_WRONG_ARGS, error=garage_module.ERROR_SERVER)
+        compact, veh_inv_id, slot = int(values[0]), int(values[1]), int(values[2])
+        paid = bool(int(values[3])) if len(values) > 3 else False
+        gun = int(values[4]) if len(values) > 4 else 0
+        return self._purchase(self.garage.buy_and_equip_item, compact, veh_inv_id, slot, paid, gun)
+
+    def on_buy_and_equip_tankman(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_BUY_AND_EQUIP_TMAN`` - ``Int4 (rev, vehInvID, slot, costIdx)``."""
+        veh_inv_id = int(args[1]) if len(args) > 1 else -1
+        slot = int(args[2]) if len(args) > 2 else -1
+        cost_index = int(args[3]) if len(args) > 3 else 0
+        return self._purchase(self.garage.buy_and_equip_tankman, veh_inv_id, slot, cost_index)
 
     # -- New Year event -------------------------------------------------
     def _new_year_response(self, result: ny_module.NewYearResult, diffs: int = 1,
