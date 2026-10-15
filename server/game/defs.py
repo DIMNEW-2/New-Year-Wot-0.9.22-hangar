@@ -16,6 +16,7 @@ treated as sections, everything else as values.
 from __future__ import annotations
 
 import os
+import re
 import xml.etree.ElementTree as ElementTree
 import zipfile
 
@@ -135,7 +136,25 @@ def _build(element) -> XmlSection:
     return _build_named(element.tag, element)
 
 
+#: The client's XML dialect declares its namespaces as *elements*
+#: (``<xmlns:xmlref>\thttp://bwt/xmlref\t</xmlns:xmlref>``) and then uses the
+#: prefix in element names (``<china:Ch05_T34_248>``), which a strict parser
+#: refuses.  Both are stripped before parsing, so the customization files
+#: (``customization/**``) read exactly like every other file.
+_XMLNS_DECLARATION = re.compile(r"<xmlns:[A-Za-z_][\w.-]*\s*>[^<]*</xmlns:[A-Za-z_][\w.-]*\s*>")
+_TAG_PREFIX = re.compile(r"(</?)([A-Za-z_][\w.-]*):")
+
+
+def strip_xml_namespaces(text: str) -> str:
+    """Drop the namespace declarations and the element prefixes of WoT XML."""
+    if ":" not in text:
+        return text
+    text = _XMLNS_DECLARATION.sub("", text)
+    return _TAG_PREFIX.sub(r"\1", text)
+
+
 def parse_xml(text: str) -> XmlSection:
+    text = strip_xml_namespaces(text)
     try:
         root = ElementTree.fromstring(text)
     except ElementTree.ParseError as error:
