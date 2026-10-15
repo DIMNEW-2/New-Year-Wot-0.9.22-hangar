@@ -308,6 +308,13 @@ def describe_installation(root: str) -> str:
     lines.append("path            : %s" % root)
     if not os.path.isdir(root):
         lines.append("state           : not a directory")
+        lines.append("hint            : --client wants the folder that holds "
+                     "WorldOfTanks.exe")
+        parent = os.path.dirname(os.path.abspath(root))
+        if os.path.isdir(parent):
+            lines.append("nearby (%s) :" % parent)
+            for name in _directory_listing(parent, limit=20):
+                lines.append("  %s" % name)
         return "\n".join(lines)
     try:
         layout = find_client(root)

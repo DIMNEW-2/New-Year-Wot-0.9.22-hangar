@@ -211,12 +211,15 @@ def _command_info(args) -> int:
 def _command_inspect(args) -> int:
     """Show what the server sees when it is pointed at an installation."""
     target = args.client or args.catalog or loader.guess_client() or os.getcwd()
-    print(loader.describe_installation(target))
+    report = loader.describe_installation(target)
+    print(report)
+    if "state           : ok" not in report:
+        return 1
     try:
         catalog = loader.load_catalog(target)
         catalog.validate()
     except Exception as error:
-        print("catalogue       : unavailable (%s)" % error)
+        print("catalogue       : unreadable (%s)" % error)
         return 1
     print("catalogue       : %d vehicles, %d decorations, %d boxes, %d chests"
           % (len(catalog.vehicles.all()), len(catalog.new_year.toys),
