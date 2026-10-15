@@ -37,6 +37,7 @@ from ..game import new_year as ny_module
 from ..proto import pack_stream, py2_dumps
 from . import commands as cmd
 from . import data as data_module
+from . import economics as economics_module
 from . import garage as garage_module
 from . import purchases as purchases_module
 from .state import AccountState
@@ -96,6 +97,7 @@ class RequestDispatcher:
         self.log = logger or LOG
         self.shop = purchases_module.Shopkeeper(state)
         self.garage = garage_module.Garage(state)
+        self.wallet = economics_module.Wallet(state)
         self._message_id = 0
         self._handlers = {
             cmd.CMD_SYNC_DATA: self.on_sync_data,
@@ -117,6 +119,11 @@ class RequestDispatcher:
             cmd.CMD_REPAIR: self.on_repair,
             cmd.CMD_VEH_SETTINGS: self.on_change_setting,
             cmd.CMD_SET_AND_FILL_LAYOUTS: self.on_set_and_fill_layouts,
+            cmd.CMD_UNLOCK: self.on_unlock,
+            cmd.CMD_EXCHANGE: self.on_exchange,
+            cmd.CMD_FREE_XP_CONV: self.on_free_xp_conv,
+            cmd.CMD_PREMIUM: self.on_premium,
+            cmd.CMD_UNLOCK_ALL: self.on_unlock_all,
             cmd.CMD_REQ_SERVER_STATS: self.on_server_stats,
             cmd.CMD_NEW_YEAR_OPEN_BOX: self.on_open_box,
             cmd.CMD_NEW_YEAR_SELECT_DISCOUNT: self.on_select_discount,
@@ -237,6 +244,35 @@ class RequestDispatcher:
         compact = int(args[2])
         count = int(args[3]) if len(args) > 3 else 1
         return self._purchase(self.shop.sell_item, item_type, compact, count)
+
+    # -- the wallet -----------------------------------------------------
+    def on_unlock(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_UNLOCK`` - ``Int3 (vehTypeCompDescr, unlockIdx, 0)``."""
+        vehicle = int(args[0])
+        index = int(args[1]) if len(args) > 1 else 0
+        return self._purchase(self.wallet.unlock, vehicle, index)
+
+    def on_exchange(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_EXCHANGE`` - ``Int3 (shopRev, gold, 0)``."""
+        gold = int(args[1]) if len(args) > 1 else 0
+        return self._purchase(self.wallet.exchange, gold)
+
+    def on_free_xp_conv(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_FREE_XP_CONV`` - ``[shopRev, xp, useDiscount, *vehicles]``."""
+        values = list(args[0]) if args and isinstance(args[0], (list, tuple)) else list(args)
+        if len(values) < 3:
+            return Response(code=cmd.RES_WRONG_ARGS, error=economics_module.ERROR_SERVER)
+        return self._purchase(self.wallet.convert_free_xp,
+                              int(values[1]), int(values[2]), values[3:])
+
+    def on_premium(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_PREMIUM`` - ``Int3 (shopRev, days, arenaUniqueID)``."""
+        days = int(args[1]) if len(args) > 1 else 0
+        return self._purchase(self.wallet.buy_premium, days)
+
+    def on_unlock_all(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_UNLOCK_ALL`` - the debug "research everything" command."""
+        return self._purchase(self.wallet.unlock_all)
 
     def on_buy_slot(self, request_id: int, args: Sequence) -> Response:
         """``CMD_BUY_SLOT`` - one more garage slot."""

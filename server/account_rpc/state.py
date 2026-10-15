@@ -57,6 +57,11 @@ def _pad_slots(values, size: int = EQUIPMENT_LAYOUT_SIZE) -> List[int]:
     padded = [int(value or 0) for value in list(values or ())[:size]]
     return padded + [0] * (size - len(padded))
 
+#: ``constants.ACCOUNT_ATTR`` - what ``account['attrs']`` carries.  The premium
+#: bit is the one the lobby reads (``account_helpers.isPremiumAccount``), and it
+#: is bit 32, so the attribute is the 64-bit value the entity def declares.
+ACCOUNT_ATTR_PREMIUM = 4294967296
+
 #: Starting wallet of a fresh local account.
 DEFAULT_CREDITS = 10000000
 DEFAULT_GOLD = 25000
@@ -205,6 +210,9 @@ class AccountState:
         self.tokens: Dict[str, Tuple[Optional[int], int]] = {}
         self.unlocks: set = set()
         self.elite_vehicles: set = set()
+        #: ``stats.vehTypeXP``: the experience of every *vehicle type* (battles
+        #: are out of scope, so it stays empty unless something grants XP).
+        self.veh_type_xp: Dict[int, int] = {}
         self.int_user_settings: Dict[str, dict] = {}
 
         self.tankman_factory = tankman_factory
@@ -495,12 +503,56 @@ class AccountState:
             "freeXP": self.free_xp,
             "unlocks": set(self.unlocks),
             "eliteVehicles": set(self.elite_vehicles),
-            "vehTypeXP": {entry.compact_descr: 0 for entry in self.vehicles.values()},
+            "vehTypeXP": self.veh_type_xp_diff(),
             "tutorialsCompleted": self.tutorials_completed,
             "vehicleSellsLeft": 0,
             "freeTMenLeft": 0,
             "freeVehiclesLeft": 0,
         }
+
+    def veh_type_xp_diff(self) -> Dict[int, int]:
+        """``stats.vehTypeXP``: every owned vehicle plus anything with XP.
+
+        ``Stats.synchronize`` merges this section key by key
+        (``synchronizeDicts``), so publishing the whole table is idempotent and
+        an update only has to carry the vehicles it changed.
+        """
+        result = {entry.compact_descr: int(self.veh_type_xp.get(entry.compact_descr, 0))
+                  for entry in self.vehicles.values()}
+        for compact, xp in self.veh_type_xp.items():
+            result.setdefault(int(compact), int(xp))
+        return result
+
+    def account_attrs(self) -> int:
+        """``account['attrs']`` - the premium bit when the account has premium."""
+        if self.premium_expiry > time.time() or self.is_premium:
+            return ACCOUNT_ATTR_PREMIUM
+        return 0
+
+    def account_diff(self) -> dict:
+        """The ``account`` section of a diff (premium state, rating)."""
+        return {
+            "attrs": self.account_attrs(),
+            "premiumExpiryTime": int(self.premium_expiry),
+            "globalRating": 0,
+        }
+
+    def add_premium_days(self, days: int) -> int:
+        """Extend the premium account by ``days``; returns the new expiry."""
+        days = int(days)
+        if days > 0:
+            base = max(self.premium_expiry, int(time.time()))
+            self.premium_expiry = base + days * 86400
+            self.is_premium = True
+        return int(self.premium_expiry)
+
+    def wallet_diff(self) -> dict:
+        """The diff a wallet command publishes (economics, account, stats)."""
+        return self.incremental_diff(extra={
+            "economics": self.economics_diff(),
+            "account": self.account_diff(),
+            "stats": self._stats_diff(),
+        })
 
     def vehicle_configurations(self) -> Dict[int, dict]:
         """What the client needs to pack a vehicle descriptor for each tank.
@@ -542,11 +594,7 @@ class AccountState:
             "rev": self.revision,
             "inventory": self._inventory_diff(),
             "stats": self._stats_diff(),
-            "account": {
-                "attrs": 0,
-                "premiumExpiryTime": self.premium_expiry,
-                "globalRating": 0,
-            },
+            "account": self.account_diff(),
             "economics": {
                 "credits": self.credits,
                 "gold": self.gold,
@@ -790,11 +838,9 @@ class AccountState:
         if "gold" in bonuses:
             self.gold += int(bonuses["gold"])
         if "premium" in bonuses:
-            days = int(bonuses["premium"])
-            if days:
-                base = max(self.premium_expiry, int(time.time()))
-                self.premium_expiry = base + days * 86400
-                self.is_premium = True
+            # ``add_premium_days`` keeps the expiry and the premium bit in one
+            # place, so a box and the premium dialog cannot disagree.
+            self.add_premium_days(int(bonuses["premium"]))
         for vehicle_data in bonuses.get("vehicles", ()) or ():
             self._grant_vehicle_bonus(vehicle_data)
         for tankman_data in bonuses.get("tankmen", ()) or ():
@@ -921,6 +967,7 @@ class AccountState:
             },
             "unlocks": sorted(self.unlocks),
             "eliteVehicles": sorted(self.elite_vehicles),
+            "vehTypeXP": {str(compact): int(xp) for compact, xp in self.veh_type_xp.items()},
             "items": {
                 str(item_type): {str(cd): count for cd, count in values.items()}
                 for item_type, values in self.items.items()
@@ -985,6 +1032,8 @@ class AccountState:
             state.tankmen[entry.inv_id] = entry
         state.unlocks = set(payload.get("unlocks") or ())
         state.elite_vehicles = set(payload.get("eliteVehicles") or ())
+        state.veh_type_xp = {int(compact): int(xp)
+                             for compact, xp in (payload.get("vehTypeXP") or {}).items()}
         state.items = {
             int(item_type): {int(cd): int(count) for cd, count in values.items()}
             for item_type, values in (payload.get("items") or {}).items()

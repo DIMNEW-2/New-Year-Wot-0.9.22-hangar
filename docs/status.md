@@ -30,6 +30,12 @@ What works today, and what is still missing or unverified.
   (`CMD_BUY_AND_EQUIP_ITEM`).  Everything the client mounts leaves the depot and
   everything it takes off goes back into it, so the counts its panels price
   against are the counts the server charges for.
+* **The wallet** — gold for credits (`CMD_EXCHANGE`, at the shop's
+  `exchangeRate`), premium account packets (`CMD_PREMIUM`, at `premiumCost`,
+  publishing `account.attrs`/`premiumExpiryTime`), vehicle experience into free
+  experience (`CMD_FREE_XP_CONV`, at `freeXPConversion`, including the free
+  conversion limit) and the research commands (`CMD_UNLOCK`, `CMD_UNLOCK_ALL`).
+  `stats.vehTypeXP` is a real, saved table.
 * **Diffs the client reads** — `inventory` (vehicles with their descriptors,
   crew, equipment, shells, settings, locks; tankmen), `stats`, `account`,
   `economics`, `tokens`, `newYear`, `('goodies','_r')`,
@@ -50,6 +56,13 @@ What works today, and what is still missing or unverified.
 * **Loot reports** — opening a box or a chest pushes a `tokenQuests` system
   message (chat action 21) with the rewards, exactly what
   `_NewYearBoxStorage.__handleSysMsg` expects.
+* **Research is inert.**  The local garage grants every researchable vehicle
+  (`researchable`), so the client's own `UnlockItemValidator` refuses to send
+  `CMD_UNLOCK` (`already_unlocked`); the handler answers the requests that still
+  arrive (an item that is already unlocked) and logs the rest.  `CMD_UNLOCK_ALL`
+  is a real command: it grants the researchable garage to an account that was
+  started with premium tanks only.  Battles are out of scope, so vehicle
+  experience only comes from the New Year bonuses.
 * **Garage validation** is the client's own: the local server trusts the module
   and device ids the client sends, checks that they belong to the vehicle and
   that they are in the depot, but it does not re-derive research trees, crew
