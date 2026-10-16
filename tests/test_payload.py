@@ -285,8 +285,48 @@ def test_the_hint_of_the_layout_names_the_package(runner: common.Runner) -> None
 # ---------------------------------------------------------------------------
 # the same, with the files of a real installation
 # ---------------------------------------------------------------------------
+#: The ways a packer may hand a member to the reader, one per index modulo.
+MEMBER_STYLES = ("stored", "zlib", "raw deflate", "gzip", "bzip2", "xz",
+                 "utf-16-le", "utf-16 (with a BOM)", "a zip around it", "gb18030")
+
+
+def _style(data: bytes, index: int) -> bytes:
+    """``data`` the way a packer with style number ``index % 10`` would ship it."""
+    style = MEMBER_STYLES[index % len(MEMBER_STYLES)]
+    if style == "stored":
+        return data
+    if style == "zlib":
+        return zlib.compress(data)
+    if style == "raw deflate":
+        return zlib.compress(data)[2:-4]
+    if style == "gzip":
+        return gzip.compress(data)
+    if style == "bzip2":
+        return bz2.compress(data)
+    if style == "xz":
+        return lzma.compress(data)
+    text = data.decode("utf-8", "replace")
+    if style == "utf-16-le":
+        return text.encode("utf-16-le")
+    if style == "utf-16 (with a BOM)":
+        return text.encode("utf-16")
+    if style == "a zip around it":
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("member.xml", data)
+        return buffer.getvalue()
+    return text.encode("gb18030", "replace")
+
+
 def test_a_packed_sample_client_reads_like_an_unpacked_one(runner: common.Runner) -> None:
-    """The catalogue of a packed build equals the one of the unpacked tree."""
+    """A packed build reads like the unpacked tree, whatever it does to a member.
+
+    A release installation does not merely pack its definitions: it may compress
+    a member on its own and write it in UTF-16 or in the code page of its
+    language (a Chinese build does both).  Every tenth file of the sample tree
+    therefore travels in another style, and the catalogue that comes out has to
+    be the one of the unpacked tree.
+    """
     client = common.require_client(runner.client)
     try:
         layout = loader.find_client(client)
@@ -304,15 +344,21 @@ def test_a_packed_sample_client_reads_like_an_unpacked_one(runner: common.Runner
     with _Workspace() as root:
         packages = os.path.join(root, "res", "packages")
         os.makedirs(packages)
+        styles = {}
         with zipfile.ZipFile(os.path.join(packages, "scripts.pkg"), "w",
                              zipfile.ZIP_DEFLATED) as archive:
             for index, (relative, path) in enumerate(sorted(files)):
                 with open(path, "rb") as handle:
                     data = handle.read()
-                if relative.endswith(".xml") and index % 97 == 0:
-                    # Every so often a member the packer compressed on its own.
-                    data = zlib.compress(data)
+                if relative.endswith(".xml"):
+                    data = _style(data, index)
+                    styles[MEMBER_STYLES[index % len(MEMBER_STYLES)]] = \
+                        styles.get(MEMBER_STYLES[index % len(MEMBER_STYLES)], 0) + 1
                 archive.writestr("scripts/item_defs/" + relative, data)
+        runner.check(len(styles) == len(MEMBER_STYLES),
+                     "the sample build uses every packaging style: %s" % sorted(styles))
+        runner.check(min(styles.values()) > 10,
+                     "and enough files per style: %s" % sorted(styles.items()))
         with zipfile.ZipFile(os.path.join(packages, "hangar.pkg"), "w") as archive:
             archive.writestr("spaces/h07_newyear_2018/space.settings", "<root/>")
         _touch(os.path.join(root, "WorldOfTanks.exe"))
@@ -327,6 +373,10 @@ def test_a_packed_sample_client_reads_like_an_unpacked_one(runner: common.Runner
                      "with the very same compact descriptors")
         runner.equal(len(packed.customization.items), len(unpacked.customization.items),
                      "the appearance items are all there")
+        for name in ("boxes", "chests", "slots"):
+            runner.equal(len(getattr(packed.new_year, name)),
+                         len(getattr(unpacked.new_year, name)),
+                         "the event's %s read from the package" % name)
         space, _spaces, _stats = loader.guess_new_year_space(root)
         runner.equal(space, "h07_newyear_2018", "and the space of the build is found")
 

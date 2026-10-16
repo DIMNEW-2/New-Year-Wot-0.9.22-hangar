@@ -549,6 +549,11 @@ def run(client: Optional[str] = None, catalog=None, source: Optional[str] = None
     if failures:
         stream.write("verify: %d problem(s) and %d warning(s) - the game would not "
                      "work yet\n" % (failures, warnings))
+        # A user who sees a FAIL needs the next command, not a description of it.
+        stream.write("        every line above that names a file is that file as "
+                     "the build ships it;\n"
+                     "        for the full picture run:  python3 -m server inspect "
+                     "--client %s\n" % (root or "<game folder>"))
         return 1
     if warnings:
         stream.write("verify: the local server is ready (%d warning(s) to read)\n"
