@@ -24,9 +24,10 @@ plain Python 2 protocol-2 pickles.
 | `bye` | — | the client is going away |
 
 `code` is the client's own `AccountCommands` value (`100` sync, `151`–`158` and
-`306`/`10015` the barracks, `116`–`119` the appearance window, `20161`–`20169`
-the New Year commands, `300` shop sync, …); `args` is a tuple because the mod
-sends `len(args)` values of the matching `doCmd*` helper.
+`306`/`10015` the barracks, `116`–`119` the appearance window, `503`–`508` and
+`600` the profile, `800` the badges, `20161`–`20169` the New Year commands, `300`
+shop sync, …); `args` is a tuple because the mod sends `len(args)` values of the
+matching `doCmd*` helper.
 
 The barracks commands come from `client/account_helpers/Inventory.py`
 (`dismissTankman`, `addTankmanSkill`, …) and `client_recycle_bin.py`
@@ -46,6 +47,25 @@ The barracks commands come from `client/account_helpers/Inventory.py`
 | `CMD_TMAN_MULTI_RESPEC` (156) | `IntArr [shopRev, vehTypeCompDescr, invID, costIdx, …]` | |
 | `CMD_TMAN_CHANGE_ROLE` (158) | `Int4 (shopRev, tmanInvID, roleIdx, vehTypeCompDescr)` | `ext` is an `EQUIP_TMAN_CODE` |
 | `CMD_ADD_TMAN_XP` (10003) | `Int3 (tmanInvID, xp, 0)` | |
+
+The profile requests come from `client/Account.py` (`requestPlayerInfo`,
+`requestAccountDossier`, …) and `account_helpers/DossierCache.py`
+(`CMD_SYNC_DOSSIERS`); the dossiers they answer with are compact descriptors the
+client parses with its own `dossiers2`, and an *empty* descriptor is a fresh
+dossier of the current version, so the local server never mirrors the client's
+block layout:
+
+| code | `args` | answer |
+| --- | --- | --- |
+| `CMD_REQ_PLAYER_INFO` (503) | `Int3 (databaseID, 0, 0)` | `ext.databaseID`/`dossier`/`clanDBID`/`clanInfo`/`globalRating`/`eSportSeasons`/`ranked` |
+| `CMD_REQ_ACCOUNT_DOSSIER` (504) | `Int3 (accountID, 0, 0)` | `ext['dossier']` (empty: the client builds a new dossier) |
+| `CMD_REQ_VEHICLE_DOSSIER` (505) | `Int3 (databaseID, vehCD, 0)` | the same for one vehicle |
+| `CMD_REQ_PLAYER_CLAN_INFO` (506) | `Int3 (databaseID, 0, 0)` | `ext.clanDBID` 0, `clanInfo` `None` |
+| `CMD_REQ_PLAYER_GLOBAL_RATING` (507) | `Int3 (accountID, 0, 0)` | `ext['globalRating']` |
+| `CMD_REQ_PLAYERS_GLOBAL_RATING` (508) | `IntArrStrArr (ids, [])` | `ext` *is* `{databaseID: rating}` |
+| `CMD_SYNC_DOSSIERS` (600) | `Int3 (version, maxChangeTime, 0)` | a `RES_STREAM` response whose stream is `(version, [(ownerID, changeTime, dossier)])` |
+| `CMD_SELECT_BADGES` (800) | `IntArr (badgeIDs)` | `diff['badges']`, validated against `item_defs/badges.xml` |
+| `CMD_SET_DOSSIER_FIELD` (2000) | `IntStr (value, path)` | `diff['cache']['SPA'][path]` |
 
 ## Server → client
 

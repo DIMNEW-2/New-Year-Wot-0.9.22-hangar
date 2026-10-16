@@ -13,6 +13,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from . import badges as badges_module
 from . import items as items_module
 from . import ny_constants as nyc
 from . import tankmen as tankmen_module
@@ -862,7 +863,8 @@ class VehicleCatalog:
 # --------------------------------------------------------------------------
 class Catalog:
     def __init__(self, new_year: NyCatalog, vehicles: VehicleCatalog,
-                 customization: "CustomizationCatalog" = None, meta: dict = None):
+                 customization: "CustomizationCatalog" = None, meta: dict = None,
+                 badges: Dict[int, badges_module.Badge] = None):
         self.new_year = new_year
         self.vehicles = vehicles
         # The appearance items of the installation (paints, camouflages, decals,
@@ -872,6 +874,10 @@ class Catalog:
 
             customization = CustomizationCatalog()
         self.customization = customization
+        # The badges of ``item_defs/badges.xml`` (``{id: Badge}``); the client
+        # reads the same file, so this is only what the profile commands
+        # validate a badge id against.
+        self.badges: Dict[int, badges_module.Badge] = dict(badges or {})
         self.meta = meta or {}
 
     @property
@@ -881,6 +887,11 @@ class Catalog:
 
     def validate(self):
         self.new_year.validate()
+
+    @property
+    def badge_ids(self) -> Dict[int, str]:
+        """``{id: name}`` of the installation's badges."""
+        return badges_module.badge_ids(self.badges)
 
     def to_json(self) -> dict:
         vehicles = self.vehicles.to_json()
@@ -927,7 +938,8 @@ class Catalog:
 
         new_year = load_ny_catalog(source)
         vehicles = load_vehicle_catalog(source)
-        return cls(new_year, vehicles, CustomizationCatalog.load(source))
+        return cls(new_year, vehicles, CustomizationCatalog.load(source),
+                   badges=badges_module.load_badges(source))
 
 
 # --------------------------------------------------------------------------

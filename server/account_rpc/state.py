@@ -67,6 +67,11 @@ def _pad_slots(values, size: int = EQUIPMENT_LAYOUT_SIZE) -> List[int]:
 #: is bit 32, so the attribute is the 64-bit value the entity def declares.
 ACCOUNT_ATTR_PREMIUM = 4294967296
 
+#: The database id of the local account (``welcome.databaseID``, the
+#: ``databaseID`` of a dossier or rating request).  The client keys the dossiers
+#: of other players by it, so the one account this server has is always ``1``.
+DATABASE_ID = 1
+
 #: Starting wallet of a fresh local account.
 DEFAULT_CREDITS = 10000000
 DEFAULT_GOLD = 25000
@@ -228,6 +233,19 @@ class AccountState:
         #: are out of scope, so it stays empty unless something grants XP).
         self.veh_type_xp: Dict[int, int] = {}
         self.int_user_settings: Dict[str, dict] = {}
+
+        #: The id of this account (see :data:`DATABASE_ID`); the dossier and the
+        #: rating requests answer for it.
+        self.database_id = DATABASE_ID
+        #: ``account['globalRating']``.  Ratings are earned in battles, and this
+        #: server has none, so every account starts - and stays - at zero.
+        self.global_rating = 0
+        #: ``diff['badges']``: the badges the profile shows
+        #: (``CMD_SELECT_BADGES``; see :mod:`server.account_rpc.profile`).
+        self.badges: List[int] = []
+        #: ``cache.SPA``: one value per dossier path, as written by
+        #: ``CMD_SET_DOSSIER_FIELD``.
+        self.dossier_fields: Dict[str, int] = {}
 
         self.tankman_factory = tankman_factory
         self.events = EventDataBuilder(catalog, start_time=self.created_at)
@@ -633,6 +651,12 @@ class AccountState:
 
     def _stats_diff(self) -> dict:
         return {
+            # ``stats['dossier']`` - the account dossier.  An empty descriptor is
+            # a *new* dossier for the client (``DossierBuilder.build('')`` packs
+            # the current version with every block zero sized and stamps the
+            # creation time), which is what an account without a single battle
+            # has to report.  See :mod:`server.account_rpc.profile`.
+            "dossier": b"",
             "slots": self.slots,
             "berths": self.berths,
             "freeXP": self.free_xp,
@@ -669,7 +693,7 @@ class AccountState:
         return {
             "attrs": self.account_attrs(),
             "premiumExpiryTime": int(self.premium_expiry),
-            "globalRating": 0,
+            "globalRating": int(self.global_rating),
         }
 
     def add_premium_days(self, days: int) -> int:
@@ -745,6 +769,10 @@ class AccountState:
             ("goodies", "_r"): self.new_year.goodies_diff(),
             ("serverSettings", "_r"): self.server_settings(),
             ("eventsData", "_r"): self.events.events_data(),
+            # The badges of the profile (``ClientBadges.synchronize``) and the
+            # dossier fields (``Stats.synchronize`` -> ``cache['SPA']``).
+            "badges": list(self.badges),
+            "cache": {"SPA": dict(self.dossier_fields)},
         }
 
     def incremental_diff(
@@ -1263,6 +1291,9 @@ class AccountState:
                 str(inv_id): [record[0].decode("latin-1"), record[1]]
                 for inv_id, record in sorted(self.dismissed_tankmen.items())
             },
+            "badges": list(self.badges),
+            "dossierFields": {path: int(value)
+                              for path, value in sorted(self.dossier_fields.items())},
             "unlocks": sorted(self.unlocks),
             "eliteVehicles": sorted(self.elite_vehicles),
             "vehTypeXP": {str(compact): int(xp) for compact, xp in self.veh_type_xp.items()},
@@ -1333,6 +1364,9 @@ class AccountState:
             int(inv_id): (record[0].encode("latin-1"), float(record[1]))
             for inv_id, record in (payload.get("dismissedTankmen") or {}).items()
         }
+        state.badges = [int(badge) for badge in payload.get("badges") or ()]
+        state.dossier_fields = {str(path): int(value)
+                                for path, value in (payload.get("dossierFields") or {}).items()}
         state.unlocks = set(payload.get("unlocks") or ())
         state.elite_vehicles = set(payload.get("eliteVehicles") or ())
         state.veh_type_xp = {int(compact): int(xp)
@@ -1353,6 +1387,7 @@ class AccountState:
 
 __all__ = [
     "AccountState",
+    "DATABASE_ID",
     "DEFAULT_CREDITS",
     "DEFAULT_FREE_XP",
     "DEFAULT_GOLD",

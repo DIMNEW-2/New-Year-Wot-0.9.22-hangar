@@ -118,9 +118,10 @@ same bridge the mod uses).
 Implemented: catalogue and garage, account sync, the appearance window (the
 customization depot, the outfits and the four commands 116–119), the barracks
 (skills, retraining, roles, passports, crew experience, dismiss/restore through
-the recycle bin), New Year event (toys, slots, crafting, boxes, chests,
-discounts, tankwomen), event quests/actions, the New Year hangar notification,
-the socket bridge and the client mod.
+the recycle bin), the profile (dossiers, the vehicle dossier cache, player info,
+ratings, badges, dossier fields), New Year event (toys, slots, crafting, boxes,
+chests, discounts, tankwomen), event quests/actions, the New Year hangar
+notification, the socket bridge and the client mod.
 
 Known gaps are tracked in `docs/status.md` — most notably the shop stream
 (prices), battles (out of scope) and the parts of the mod that can only be

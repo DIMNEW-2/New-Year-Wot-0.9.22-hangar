@@ -45,6 +45,7 @@ from . import barracks as barracks_module
 from . import data as data_module
 from . import economics as economics_module
 from . import garage as garage_module
+from . import profile as profile_module
 from . import purchases as purchases_module
 from .state import AccountState
 
@@ -133,6 +134,9 @@ class RequestDispatcher:
         self.garage = garage_module.Garage(state)
         self.customization = customization_module.CustomizationKeeper(state, self.shop)
         self.barracks = barracks_module.Barracks(state, self.shop)
+        #: The profile: the dossiers, the badges and the rating requests
+        #: (see :mod:`server.account_rpc.profile`).
+        self.profile = profile_module.Profile(state)
         self.wallet = economics_module.Wallet(state)
         self._message_id = 0
         self._handlers = {
@@ -176,6 +180,15 @@ class RequestDispatcher:
             cmd.CMD_PREMIUM: self.on_premium,
             cmd.CMD_UNLOCK_ALL: self.on_unlock_all,
             cmd.CMD_REQ_SERVER_STATS: self.on_server_stats,
+            cmd.CMD_REQ_PLAYER_INFO: self.on_player_info,
+            cmd.CMD_REQ_ACCOUNT_DOSSIER: self.on_account_dossier,
+            cmd.CMD_REQ_VEHICLE_DOSSIER: self.on_vehicle_dossier,
+            cmd.CMD_REQ_PLAYER_CLAN_INFO: self.on_player_clan_info,
+            cmd.CMD_REQ_PLAYER_GLOBAL_RATING: self.on_player_global_rating,
+            cmd.CMD_REQ_PLAYERS_GLOBAL_RATING: self.on_players_global_rating,
+            cmd.CMD_SYNC_DOSSIERS: self.on_sync_dossiers,
+            cmd.CMD_SELECT_BADGES: self.on_select_badges,
+            cmd.CMD_SET_DOSSIER_FIELD: self.on_set_dossier_field,
             cmd.CMD_NEW_YEAR_OPEN_BOX: self.on_open_box,
             cmd.CMD_NEW_YEAR_SELECT_DISCOUNT: self.on_select_discount,
             cmd.CMD_NEW_YEAR_SELECT_TANKMAN: self.on_select_tankman,
@@ -192,7 +205,6 @@ class RequestDispatcher:
         #: and the log records the fact so real gaps stay visible.
         self._acknowledged = {
             cmd.CMD_ADD_INT_USER_SETTINGS,
-            cmd.CMD_SYNC_DOSSIERS,
         }
 
     # -- entry point ----------------------------------------------------
@@ -449,6 +461,82 @@ class RequestDispatcher:
     def on_add_tankman_xp(self, request_id: int, args: Sequence) -> Response:
         """``CMD_ADD_TMAN_XP`` - ``Int3 (tmanInvID, xp, 0)``."""
         return self._barracks(self.barracks.add_xp, int(args[0]), int(args[1]))
+
+    # -- the profile ------------------------------------------------------
+    def _profile(self, action, *args) -> Response:
+        """Run one profile operation and answer with its payload.
+
+        A profile operation either describes what to *send* (the dossier, the
+        clan info, a rating - a plain ``ext`` dictionary) or what *changed* (a
+        badge selection, a dossier field - an outcome carrying a ``diff``).
+        """
+        try:
+            outcome = action(*args)
+        except profile_module.ProfileError as error:
+            self.log.info("profile: refused (%s)", error)
+            return Response(code=error.code, error=error.error)
+        except (TypeError, ValueError, IndexError) as error:
+            self.log.info("profile: bad arguments (%s)", error)
+            return Response(code=cmd.RES_WRONG_ARGS,
+                            error=profile_module.ERROR_WRONG_ARGS)
+        if isinstance(outcome, dict) and "diff" in outcome:
+            return Response(ext=outcome.get("ext"), diffs=[outcome["diff"]])
+        return Response(ext=outcome if isinstance(outcome, dict) else None)
+
+    def on_player_info(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_REQ_PLAYER_INFO`` - ``Int3 (databaseID, 0, 0)``."""
+        return self._profile(self.profile.player_info_ext,
+                             int(args[0]) if args else 0)
+
+    def on_account_dossier(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_REQ_ACCOUNT_DOSSIER`` - ``Int3 (accountID, 0, 0)``."""
+        return self._profile(self.profile.dossier_ext)
+
+    def on_vehicle_dossier(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_REQ_VEHICLE_DOSSIER`` - ``Int3 (databaseID, vehCD, 0)``."""
+        return self._profile(self.profile.dossier_ext,
+                             int(args[1]) if len(args) > 1 else 0)
+
+    def on_player_clan_info(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_REQ_PLAYER_CLAN_INFO`` - ``Int3 (databaseID, 0, 0)``."""
+        return self._profile(self.profile.clan_info_ext)
+
+    def on_player_global_rating(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_REQ_PLAYER_GLOBAL_RATING`` - ``Int3 (accountID, 0, 0)``."""
+        return self._profile(self.profile.global_rating_ext,
+                             int(args[0]) if args else 0)
+
+    def on_players_global_rating(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_REQ_PLAYERS_GLOBAL_RATING`` - ``IntArrStrArr (ids, [])``."""
+        account_ids = args[0] if args and isinstance(args[0], (list, tuple)) else ()
+        return self._profile(self.profile.global_ratings_ext, list(account_ids))
+
+    def on_sync_dossiers(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_SYNC_DOSSIERS`` - ``Int3 (version, maxChangeTime, 0)``.
+
+        The answer is a stream: the client's ``DossierCache`` subscribes to the
+        request id when it sees ``RES_STREAM`` and unpacks ``(version, [...])``
+        with ``zlib`` + ``cPickle`` (``SyncController``).  The list is empty -
+        this account has no vehicle dossiers to cache - and echoing the version
+        keeps the client from clearing what it has.
+        """
+        version = int(args[0]) if args else 0
+        change_time = int(args[1]) if len(args) > 1 else 0
+        dossiers = self.profile.sync_dossiers(version, change_time)
+        self.log.info("dossier sync: version %s, %d descriptor(s), max change time %s",
+                      dossiers[0], len(dossiers[1]), change_time)
+        return Response(code=cmd.RES_STREAM, stream=dossiers)
+
+    def on_select_badges(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_SELECT_BADGES`` - ``IntArr (badgeIDs)``."""
+        badges = args[0] if args and isinstance(args[0], (list, tuple)) else args
+        return self._profile(self.profile.select_badges, list(badges))
+
+    def on_set_dossier_field(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_SET_DOSSIER_FIELD`` - ``IntStr (value, path)``."""
+        value = int(args[0]) if args else 0
+        path = args[1] if len(args) > 1 else ""
+        return self._profile(self.profile.set_dossier_field, value, path)
 
     def on_repair(self, request_id: int, args: Sequence) -> Response:
         """``CMD_REPAIR`` - ``Int3 (vehInvID, 0, 0)``."""

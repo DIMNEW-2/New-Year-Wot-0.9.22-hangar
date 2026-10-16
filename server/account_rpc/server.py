@@ -104,7 +104,8 @@ class Session:
             {
                 "type": "welcome",
                 "protocol": PROTOCOL_VERSION,
-                "account": {"name": self.state.name, "databaseID": 1},
+                "account": {"name": self.state.name,
+                            "databaseID": int(getattr(self.state, "database_id", 1))},
                 "diff": diff,
             }
         )

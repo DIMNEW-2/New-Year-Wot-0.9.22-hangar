@@ -44,6 +44,19 @@ What works today, and what is still missing or unverified.
   (`CMD_BUY_AND_EQUIP_ITEM`).  Everything the client mounts leaves the depot and
   everything it takes off goes back into it, so the counts its panels price
   against are the counts the server charges for.
+* **The profile** — the lobby's statistics screens are served: the account
+  dossier travels in the sync (`stats.dossier`) and in the answers of
+  ``CMD_REQ_ACCOUNT_DOSSIER``/``CMD_REQ_VEHICLE_DOSSIER``, the vehicle dossier
+  cache is synchronized with the streamed ``CMD_SYNC_DOSSIERS``
+  (``DossierCache``), ``CMD_REQ_PLAYER_INFO``/``CMD_REQ_PLAYER_CLAN_INFO``
+  describe the account to its own profile window, both global rating requests
+  answer zero, ``CMD_SELECT_BADGES`` keeps the badges the profile shows (checked
+  against the installation's own ``item_defs/badges.xml``) and
+  ``CMD_SET_DOSSIER_FIELD`` writes one value under a dossier path (published in
+  the ``SPA`` cache, where the client reads such paths).  The dossiers
+  themselves are empty on purpose: the client turns an empty descriptor into a
+  fresh dossier of the current version (``DossierBuilder.build('')``), which is
+  what an account without a single battle reports.
 * **The barracks** — a crew member is a descriptor, and every operation the
   personal file offers rewrites it the way the client's own ``TankmanDescr``
   would: learning a skill (`CMD_TMAN_ADD_SKILL`), forgetting them
@@ -168,10 +181,15 @@ What works today, and what is still missing or unverified.
   ``TankmanDescr.respecialize``.  A restore from the recycle bin is free inside
   the window the shop config calls free, so the local server never takes gold
   for a price the client does not show.
-* **Dossiers and profile** (`CMD_REQ_ACCOUNT_DOSSIER`, `CMD_REQ_VEHICLE_DOSSIER`,
-  `CMD_SET_DOSSIER_FIELD`, `CMD_SELECT_BADGES`, the global rating requests) are
-  not answered: the statistics and profile screens stay empty.  Also
-  unimplemented: `CMD_VEHICLE_TRADE_IN` and `CMD_QUERY_BALANCE_INFO`.
+* **Statistics start at zero.**  The dossier requests are answered and the
+  profile window renders, but every number in it is the empty dossier's:
+  an account that never fought has no battles, no wins, no average damage and no
+  achievements, and this server never pretends otherwise (it has no battles
+  *and* no way to fabricate one - the live server's numbers come from battle
+  results, see ``docs/protocol.md``).  The dossier of a vehicle and the
+  statistics of a crew member are empty for the same reason.  Also
+  unimplemented: `CMD_VEHICLE_TRADE_IN` (trade-in of an old tank for a discount)
+  and `CMD_QUERY_BALANCE_INFO` (the Wargaming balance of an account).
 * **The shop** prices what `item_defs` prices; personal discounts and boosters
   (`goodies`) beyond the New Year ones are not implemented.
 * **Goodies definitions** (`scripts/server_xml/goodies.xml`) are server-side
