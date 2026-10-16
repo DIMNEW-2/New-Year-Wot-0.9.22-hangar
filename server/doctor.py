@@ -417,6 +417,41 @@ def check_session(catalog, tankmen_configs=None, stream=None) -> Report:
         else:
             report.fail("a second sync is not answered", repr(response))
 
+        response, _, _, streams = client.command(7, cmd.CMD_SYNC_DOSSIERS, (3, 0, 0))
+        frame = streams[0] if streams else client.recv()
+        if response.get("code") != cmd.RES_STREAM or frame.get("type") != "stream":
+            report.fail("the dossier cache (CMD_SYNC_DOSSIERS) is not streamed",
+                        "answer %r, next frame %r" % (response, frame))
+        else:
+            version, dossiers = py2_loads(zlib.decompress(frame.get("data")))
+            if version == 3 and not dossiers:
+                report.ok("the dossier cache is streamed",
+                          "version %s, %d descriptor(s)" % (version, len(dossiers)))
+            else:
+                report.fail("the dossier cache answers with something else",
+                            "version %r, %r" % (version, dossiers))
+
+        response, _, _, _ = client.command(8, cmd.CMD_REQ_ACCOUNT_DOSSIER, (1, 0, 0))
+        ext = py2_loads(response.get("ext")) if response.get("ext") else {}
+        if response.get("code") == cmd.RES_SUCCESS and ext.get("dossier") == b"":
+            report.ok("the account dossier is answered",
+                      "empty (the client builds a fresh dossier from it)")
+        else:
+            report.fail("the account dossier is not answered", repr(response))
+
+        badges = sorted(getattr(catalog, "badges", None) or ())
+        if not badges:
+            report.warn("no badge to select", "the installation describes no badges")
+        else:
+            response, diffs, _, _ = client.command(9, cmd.CMD_SELECT_BADGES, ([badges[0]],))
+            selected = (diffs[-1].get("badges") if diffs else None)
+            if response.get("code") == cmd.RES_SUCCESS and selected == [badges[0]]:
+                report.ok("a badge of the profile is selected",
+                          "badge %s, the diff publishes it" % badges[0])
+            else:
+                report.fail("selecting a badge does not publish it",
+                            "answer %r, diff %r" % (response, diffs[-1:] or None))
+
         response, _, _, _ = client.command(6, 99999, (0, 0, 0))
         if response.get("code") == cmd.RES_SUCCESS:
             report.warn("an unsupported command is answered with success",

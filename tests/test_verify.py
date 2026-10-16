@@ -45,6 +45,7 @@ def test_the_doctor_is_green(runner: common.Runner) -> None:
                   "the crew name lists are there", "the handshake answers",
                   "the account diff is complete", "the price cache is streamed",
                   "a loot box opens", "a garage command is answered",
+                  "the dossier cache is streamed", "the account dossier is answered",
                   "an unsupported command is refused"):
         runner.check(any(title in line for line in _titles(report)),
                      "the report has a line about %r" % title)
@@ -62,6 +63,9 @@ def test_the_doctor_checks_the_wire(runner: common.Runner) -> None:
                  "the client's repeated sync was answered too")
     runner.check("the loot box updates the account" in report,
                  "opening a box pushed a diff")
+    runner.check("a badge of the profile is selected" in report
+                 or "no badge to select" in report,
+                 "the profile commands were exercised too")
 
 
 def test_the_doctor_can_skip_the_session(runner: common.Runner) -> None:
