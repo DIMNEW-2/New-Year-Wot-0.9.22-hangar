@@ -117,7 +117,8 @@ same bridge the mod uses).
 
 Implemented: catalogue and garage, account sync, the shop cache and its stream
 (every priced item, the appearance price factors, the not-in-shop lists, the
-trade-in configuration), buying and selling vehicles/items, slots and berths,
+trade-in configuration, the medal rewards), buying and selling vehicles/items,
+slots and berths,
 trade-in of a premium vehicle, the wallet (exchange, premium, free experience,
 research, the WGMBalance rows), the appearance window (the customization depot,
 the outfits and the four commands 116–119), the barracks (skills, retraining,

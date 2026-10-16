@@ -13,6 +13,8 @@ the mod to move the server or to turn parts of it off:
 ``WOTNY_LOG``                file the mod writes its log to
 ``WOTNY_NO_HANGAR``          ``1`` keeps the stock hangar space (no New Year
                              scene switch)
+``WOTNY_VERBOSE``            ``1`` also logs the account-base calls the mod
+                             ignores on purpose (chat commands, keep-alives)
 ===========================  ==================================================
 """
 
@@ -64,6 +66,8 @@ AUTO_CONNECT = _flag('WOTNY_AUTO_CONNECT', True)
 CONNECT_DELAY = _number('WOTNY_CONNECT_DELAY', DEFAULT_CONNECT_DELAY, float)
 LOG_PATH = os.environ.get('WOTNY_LOG') or ''
 USE_NEW_YEAR_HANGAR = not _flag('WOTNY_NO_HANGAR', False)
+#: Log the base calls the mod ignores on purpose (see ``account_proxy``).
+VERBOSE = _flag('WOTNY_VERBOSE', False)
 
 #: ``auth_realm`` of the login parameters.  The stock client sends the realm of
 #: the build (``constants.AUTH_REALM``); the local server ignores it but the

@@ -13,6 +13,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from . import achievements_reward as achievements_reward_module
 from . import badges as badges_module
 from . import items as items_module
 from . import ny_constants as nyc
@@ -875,9 +876,19 @@ class Catalog:
     def __init__(self, new_year: NyCatalog, vehicles: VehicleCatalog,
                  customization: "CustomizationCatalog" = None, meta: dict = None,
                  badges: Dict[int, badges_module.Badge] = None,
-                 legacy_customization: "LegacyCustomization" = None):
+                 legacy_customization: "LegacyCustomization" = None,
+                 achievements_reward: dict = None):
         self.new_year = new_year
         self.vehicles = vehicles
+        #: The ``achievementsReward`` section of the shop cache - the crystal
+        #: (bond) every medal pays (see :mod:`server.game.achievements_reward`).
+        #: ``Catalog.load`` of a client tree cannot build it (the record ids
+        #: live in the client's *scripts*, not in ``item_defs``), so
+        #: :func:`server.loader.load_catalog` fills it in; a catalogue that
+        #: carries no table publishes the disabled section.
+        self.achievements_reward = (achievements_reward_module.from_json(achievements_reward)
+                                    if achievements_reward is not None
+                                    else achievements_reward_module.disabled())
         # The appearance items of the installation (paints, camouflages, decals,
         # modifications and styles); empty when the installation ships none.
         if customization is None:
@@ -942,6 +953,7 @@ class Catalog:
             "devices": vehicles["devices"],
             "customization": self.customization.to_json(),
             "legacyCustomization": self.legacy_customization.to_json(),
+            "achievementsReward": achievements_reward_module.to_json(self.achievements_reward),
         }
         return payload
 
@@ -964,7 +976,8 @@ class Catalog:
         # simply knows none (the shop publishes no customization prices).
         customization = CustomizationCatalog.from_json(payload.get("customization") or {})
         legacy = LegacyCustomization.from_json(payload.get("legacyCustomization") or {})
-        return cls(new_year, vehicles, customization, payload, legacy_customization=legacy)
+        return cls(new_year, vehicles, customization, payload, legacy_customization=legacy,
+                   achievements_reward=payload.get("achievementsReward"))
 
     @classmethod
     def load(cls, source: DefsSource) -> "Catalog":

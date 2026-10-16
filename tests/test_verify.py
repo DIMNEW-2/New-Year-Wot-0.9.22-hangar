@@ -44,6 +44,7 @@ def test_the_doctor_is_green(runner: common.Runner) -> None:
     for title in ("the game data was found", "the New Year definitions are complete",
                   "the crew name lists are there", "the handshake answers",
                   "the account diff is complete", "the price cache is streamed",
+                  "the shop tables of the installation are read",
                   "a loot box opens", "a garage command is answered",
                   "the dossier cache is streamed", "the account dossier is answered",
                   "an unsupported command is refused"):

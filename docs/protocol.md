@@ -122,6 +122,13 @@ the stream, if any.
   `WALLET_NOT_AVAILABLE`), `vehsLock` (`Inventory.synchronize` — the lock of
   every locked vehicle, keyed by inventory id) and `SPA` (the dossier paths
   written by `CMD_SET_DOSSIER_FIELD`).
+* The shop cache travels as a `RES_STREAM` response and a `stream` frame of its
+  own (`CMD_SYNC_SHOP`): `items` (every price plus the tables a requester
+  indexes), `goodies` (the personal offers of the event: definitions, their
+  prices and the not-in-shop list), `achievementsReward` (the crystal reward of
+  every medal, keyed by the record ids of the client's own
+  `common/dossiers2/custom/records.py`) and `defaults`, which repeats the tables
+  a dialog falls back to (`DefaultShopRequester` reads `defaults['items']`).
 * A dossier answer is a compact descriptor built by
   `server/game/dossier.py`: the header, then one size per block in layout order
   and the block payloads.  `CMD_SYNC_DOSSIERS` (600) streams them (a `stream`

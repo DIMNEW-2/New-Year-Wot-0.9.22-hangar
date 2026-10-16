@@ -25,8 +25,9 @@ is built here:
 ``goodies``          the personal discounts of the event (see
                      :mod:`server.game.goodies`)
 ``achievementsReward``
-                     the bond reward of an achievement (disabled: the local
-                     server awards no bonds)
+                     the crystal (bond) reward of every medal, read from the
+                     installation (see
+                     :mod:`server.game.achievements_reward`)
 ``defaults``         what ``ShopCommonStats`` falls back to for a missing key
 ===================  =====================================================
 
@@ -40,6 +41,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
 
+from . import achievements_reward as achievements_reward_module
 from .catalog import Catalog
 from .goodies import GoodieTable
 
@@ -121,12 +123,12 @@ REF_SYSTEM = {
     "posByXPinTeam": 0,
 }
 
-#: ``ShopRequester.getAchievementReward`` reads this section and gives up when
-#: ``isEnabled`` is false - which is what the local server publishes: bond
-#: rewards belong to battle achievements, and there are no battles here.  The
-#: shape travels complete anyway, so a reader that indexes ``groups``/``medals``
-#: finds the dictionaries instead of ``None``.
-ACHIEVEMENTS_REWARD = {"isEnabled": False, "groups": {}, "medals": {}}
+#: The fallback of the ``achievementsReward`` section - what a catalogue that
+#: carries no medal table publishes, so a reader that indexes
+#: ``groups``/``medals`` finds dictionaries instead of ``None``.  The real table
+#: is built per installation by :mod:`server.game.achievements_reward` (the
+#: crystal/bond reward of every medal, keyed by the client's own record ids).
+ACHIEVEMENTS_REWARD = achievements_reward_module.DISABLED
 
 #: ``accounts`` are indexed by nation id, so the tables must cover every nation
 #: the client knows (``nations.NAMES`` has ten of them, ``NONE_INDEX`` is 15).
@@ -207,6 +209,12 @@ def build_shop(catalog: Catalog, revision: int = SHOP_REV,
     # emblems have hidden lists of their own).
     items = _items_section(catalog, prices)
     goodie_section = _goodies_table(goodies)
+    # ``ShopRequester.getAchievementReward`` reads the medal rewards of the
+    # *installation* (see :mod:`server.game.achievements_reward`); a catalogue
+    # that carries none publishes the disabled section, which the requester
+    # answers with "no reward" instead of a warning.
+    achievements_reward = dict(getattr(catalog, "achievements_reward", None)
+                               or ACHIEVEMENTS_REWARD)
     # ``ShopRequester._response`` hands this dictionary to
     # ``DefaultShopRequester`` (``self.defaults.update(invData['defaults'])``)
     # and every table that requester falls back to is read through
@@ -226,7 +234,7 @@ def build_shop(catalog: Catalog, revision: int = SHOP_REV,
         "freeXPConversion": FREE_XP_CONVERSION,
         "freeXPToTManXPRate": FREE_XP_TO_TMAN_XP_RATE,
         "goodies": goodie_section,
-        "achievementsReward": dict(ACHIEVEMENTS_REWARD),
+        "achievementsReward": achievements_reward,
         "restore_config": _restore_config(),
     }
     return {
@@ -264,7 +272,7 @@ def build_shop(catalog: Catalog, revision: int = SHOP_REV,
         "playerInscriptionCost": {CUSTOMIZATION_DAYS: (0, 50)},
         "playerEmblemCost": {CUSTOMIZATION_DAYS: (0, 50)},
         "goodies": goodie_section,
-        "achievementsReward": dict(ACHIEVEMENTS_REWARD),
+        "achievementsReward": achievements_reward,
     }
 
 

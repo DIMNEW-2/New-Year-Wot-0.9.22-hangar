@@ -14,6 +14,7 @@ checker actually notices a disagreement.
 
 from __future__ import annotations
 
+import ast
 import io
 import os
 import sys
@@ -131,6 +132,98 @@ def test_an_unevaluable_table_says_why(runner: common.Runner) -> None:
     note = checker._note_for_missing("NATIONAL_SETTINGS", {"NAMES": ()})
     runner.check("no SETTING_BY_NATION_ID" in note or "has no" in note,
                  "otherwise the client file is blamed: %s" % note)
+
+
+# ---------------------------------------------------------------------------
+# the mod's own sources
+# ---------------------------------------------------------------------------
+def _client_mod_root() -> str:
+    """``client_mod`` of this repository."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(root, "client_mod")
+
+
+def _mod_root() -> str:
+    """``client_mod/res_mods/<version>/scripts/client/gui/mods`` of this repo."""
+    return os.path.join(_client_mod_root(), "res_mods", "0.9.22.0.1", "scripts",
+                        "client", "gui", "mods")
+
+
+def _parsed(path: str):
+    with open(path) as handle:
+        return ast.parse(handle.read())
+
+
+def _names_of(node) -> set:
+    """Every ``Name``/``Attribute`` the node mentions (a cheap reference scan)."""
+    found = set()
+    for child in ast.walk(node):
+        if isinstance(child, ast.Name):
+            found.add(child.id)
+        elif isinstance(child, ast.Attribute):
+            found.add(child.attr)
+    return found
+
+
+def test_the_mod_answers_the_routine_base_calls_quietly(runner: common.Runner) -> None:
+    """``_IGNORED_CALLS`` is what the bridge's ``__getattr__`` treats as routine.
+
+    The client's own lobby talks to its ``base`` all the time - the chat channel
+    asks for the last service messages (``ClientChat.requestLastSysMessages`` ->
+    ``base.chatCommandFromClient``), the connection manager keeps the entity
+    alive and the client pushes its properties.  The mod answers every one of
+    them with a no-op and only ``WOTNY_VERBOSE=1`` writes a line for them, so a
+    ``wotny.log`` a user reports stays readable.  The mod runs in the client's
+    Python 2, so the file is parsed, not imported.
+    """
+    proxy = os.path.join(_mod_root(), "wotny", "account_proxy.py")
+    tree = _parsed(proxy)
+    ignored = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(
+                getattr(target, "id", None) == "_IGNORED_CALLS" for target in node.targets):
+            ignored = ast.literal_eval(node.value)
+            break
+    runner.check(ignored, "the mod names the calls it ignores on purpose")
+    runner.check("chatCommandFromClient" in ignored,
+                 "the chat commands of the lobby are among them: %r" % (ignored,))
+    functions = [node for node in ast.walk(tree)
+                 if isinstance(node, ast.FunctionDef) and node.name == "__getattr__"]
+    runner.equal(len(functions), 1, "the base mailbox has exactly one ``__getattr__``")
+    runner.check("_IGNORED_CALLS" in _names_of(functions[0]),
+                 "and it consults the list instead of logging every call")
+
+    log_source = open(os.path.join(_mod_root(), "wotny", "log.py")).read()
+    log_tree = ast.parse(log_source)
+    defined = {node.name for node in ast.walk(log_tree)
+               if isinstance(node, ast.FunctionDef)}
+    runner.check("debug" in defined, "the logger has a level for those calls")
+    runner.check("config.VERBOSE" in log_source,
+                 "and writes only when the mod is asked to be verbose")
+    config_tree = _parsed(os.path.join(_mod_root(), "wotny", "config.py"))
+    runner.check("VERBOSE" in _names_of(config_tree), "the flag is a config value")
+
+    # Every file of the package is Python 2 that a Python 2 client parses: the
+    # sources ship as sources (the release client would otherwise ignore them).
+    package = os.path.join(_mod_root(), "wotny")
+    for name in sorted(os.listdir(package)):
+        if not name.endswith(".py"):
+            continue
+        runner.check(bool(_parsed(os.path.join(package, name))),
+                     "%s parses" % name)
+
+    # The environment table of the mod's README is the list of variables the
+    # config reads - a variable a user is told to set has to exist.
+    variables = {node.value for node in ast.walk(config_tree)
+                 if isinstance(node, ast.Constant)
+                 and isinstance(node.value, str) and node.value.startswith("WOTNY_")}
+    runner.check(variables, "the config reads the environment")
+    with open(os.path.join(_client_mod_root(), "README.md")) as handle:
+        readme = handle.read()
+    documented = {line.split("`")[1] for line in readme.splitlines()
+                  if line.startswith("| `WOTNY_")}
+    runner.equal(sorted(documented), sorted(variables),
+                 "the documented variables are the ones the config reads")
 
 
 def main(argv=None) -> int:

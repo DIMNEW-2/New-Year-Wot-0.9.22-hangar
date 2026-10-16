@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Dict, Optional
 
 from .game import tankmen as tankmen_module
+from .game import achievements_reward as achievements_reward_module
 from .game.catalog import Catalog
 from .game.defs import DefsError, find_client_script_package as _find_package, open_defs
 
@@ -367,9 +368,86 @@ def load_catalog(path_or_client: str) -> Catalog:
 
     source = open_client_defs(path_or_client)
     try:
-        return Catalog.load(source)
+        catalog = Catalog.load(source)
     finally:
         source.close()
+    # The ``achievementsReward`` section of the shop cache needs a file of the
+    # client's *scripts* (the record ids of its dossiers), which is not part of
+    # ``item_defs`` - and a catalog JSON export carries the table it was
+    # exported with.  An installation whose scripts cannot be read keeps the
+    # disabled section.
+    catalog.achievements_reward = achievements_reward_module.load(
+        client_script_reader(path_or_client))
+    return catalog
+
+
+def client_script_reader(client_root: str):
+    """A callable reading one file of an installation's ``scripts`` tree.
+
+    The tree of a release build lives in ``res/scripts.pkg`` and an unpacked one
+    in ``res/scripts``; both are understood, and the folder may be named
+    directly (the ``scripts`` folder itself, a ``scripts.pkg``) or be the client
+    root.  The returned callable answers a relative path (``common/…``) with the
+    text of the file or ``None`` - a reader that never raises, so a caller can
+    use it against any installation.
+    """
+    folder = None
+    try:
+        layout = find_client(client_root)
+    except ClientNotFound:
+        layout = None
+    if layout is not None:
+        folder = layout.scripts
+    if not folder:
+        root = _normalise_root(client_root)
+        for candidate in ([root] if root else []) + [os.path.join(root, name)
+                                                     for name in ("res", "scripts", "common")]:
+            if not candidate or not os.path.isdir(candidate):
+                continue
+            if os.path.isdir(os.path.join(candidate, "common")):
+                folder = candidate
+                break
+            if os.path.isdir(os.path.join(candidate, "res", "scripts")):
+                folder = os.path.join(candidate, "res", "scripts")
+                break
+    if not folder and os.path.isfile(client_root or "") and _is_script_package(client_root):
+        folder = client_root
+    if folder and os.path.isdir(folder):
+        def read_from_folder(rel_path, _folder=folder):
+            path = os.path.join(_folder, rel_path.replace("/", os.sep))
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                    return handle.read()
+            except OSError:
+                return None
+
+        return read_from_folder
+
+    archive = None
+    if folder and os.path.isfile(folder):
+        archive = folder
+    else:
+        archive = find_client_script_package(_normalise_root(client_root) or client_root)
+    if archive:
+        def read_from_archive(rel_path, _archive=archive):
+            wanted = "/" + rel_path.lower()
+            with_suffix = "/scripts" + wanted
+            try:
+                with zipfile.ZipFile(_archive) as handle:
+                    for info in handle.infolist():
+                        name = info.filename.replace("\\", "/").lower().lstrip("/")
+                        if name.endswith(wanted) or name.endswith(with_suffix):
+                            return handle.read(info.filename).decode("utf-8", "replace")
+            except (zipfile.BadZipFile, OSError, RuntimeError):
+                return None
+            return None
+
+        return read_from_archive
+
+    def no_scripts(rel_path):
+        return None
+
+    return no_scripts
 
 
 def load_tankmen_configs(client_root: str, nations=None) -> Dict[str, tankmen_module.NationConfig]:
@@ -392,6 +470,7 @@ def load_tankmen_configs(client_root: str, nations=None) -> Dict[str, tankmen_mo
 __all__ = [
     "ClientLayout",
     "ClientNotFound",
+    "client_script_reader",
     "candidate_client_roots",
     "describe_installation",
     "find_client",

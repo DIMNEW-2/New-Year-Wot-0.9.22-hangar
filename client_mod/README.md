@@ -60,6 +60,7 @@ step) and install the resulting `mods/0.9.22.0.1/*.wotmod`.
 | `WOTNY_CONNECT_DELAY` | `3.0` | seconds before the automatic login |
 | `WOTNY_LOG` | `<game folder>/wotny.log` | log file |
 | `WOTNY_NO_HANGAR` | `0` | `1` keeps the stock hangar space instead of the New Year one |
+| `WOTNY_VERBOSE` | `0` | `1` also logs the account-base calls the mod ignores on purpose (chat commands, keep-alives) |
 
 ## Troubleshooting
 

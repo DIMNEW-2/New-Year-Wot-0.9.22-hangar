@@ -376,6 +376,20 @@ def check_session(catalog, tankmen_configs=None, stream=None) -> Report:
                                        min((shop.get("premiumCost") or {0: 0}).values())))
             else:
                 report.fail("the price cache is empty", "%d prices" % len(prices))
+            # The parts of the cache that come from the client's own sources
+            # (the record table of the dossiers, the appearance factors, the
+            # personal offers built from the catalogue) are the ones a wrong or
+            # packed installation can leave empty - worth a line of their own.
+            items = shop.get("items") or {}
+            offers = ((shop.get("goodies") or {}).get("goodies")) or {}
+            reward = shop.get("achievementsReward") or {}
+            appearance = sum(len(table) for table in (items.get("camouflagePriceFactors") or ()))
+            report.ok("the shop tables of the installation are read",
+                      "%d personal offers, %s, %d priced camouflages, %d not-in-shop items"
+                      % (len(offers),
+                         "%d medal rewards" % len(reward.get("medals") or {})
+                         if reward.get("isEnabled") else "no medal rewards",
+                         appearance, len(items.get("notInShopItems") or ())))
 
         box = _first_box(state)
         if box is None:

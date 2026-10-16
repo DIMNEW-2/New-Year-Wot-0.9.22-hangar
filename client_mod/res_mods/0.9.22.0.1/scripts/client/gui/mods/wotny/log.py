@@ -81,6 +81,18 @@ def info(message, *args):
     write(message % args if args else message)
 
 
+def debug(message, *args):
+    """Log a detail of the mod (only with ``WOTNY_VERBOSE=1``).
+
+    The lobby of the client talks to its ``base`` constantly (chat commands,
+    keep-alives, property pushes).  The mod answers all of them with a no-op -
+    logging each one at ``info`` would bury the lines that matter.
+    """
+    if not config.VERBOSE:
+        return
+    write('DEBUG: ' + (message % args if args else message))
+
+
 def warning(message, *args):
     write('WARNING: ' + (message % args if args else message))
 

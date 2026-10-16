@@ -540,14 +540,22 @@ def test_the_shop_carries_the_legacy_appearance_tables(runner: common.Runner) ->
                              "a vehicle camouflage factor belongs to a real vehicle")
                 runner.equal(factor, vehicle.camouflage_price_factor,
                              "and is the installation's own ``<camouflage><priceFactor>``")
-        # ``ShopRequester.getAchievementReward`` reads this section and gives up
-        # on ``isEnabled`` alone - which is what a server without bonds sends.
+        # ``ShopRequester.getAchievementReward`` looks a medal up in
+        # ``medals`` by the client's own record id and renders the group it
+        # finds; the table itself is checked in ``test_achievements_reward.py``.
         reward = shop["achievementsReward"]
         runner.equal(sorted(reward), ["groups", "isEnabled", "medals"],
                      "the achievement reward carries the client's three keys")
-        runner.equal(reward["isEnabled"], False, "bond rewards are disabled")
+        runner.equal(reward, state.catalog.achievements_reward,
+                     "the shop publishes the table of the installation")
         runner.check(isinstance(reward["groups"], dict) and isinstance(reward["medals"], dict),
                      "and both tables are dictionaries a reader can index")
+        if reward["isEnabled"]:
+            for record_id, index in sorted(reward["medals"]):
+                group_ids = reward["medals"][(record_id, index)]
+                runner.check(all(group_id in reward["groups"] for group_id in group_ids),
+                             "medal %d points at a group of the table" % record_id)
+                runner.equal(index, 0, "under the key the client asks for")
         bridge.close()
     finally:
         server.stop()

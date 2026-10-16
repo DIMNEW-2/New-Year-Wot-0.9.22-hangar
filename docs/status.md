@@ -55,6 +55,16 @@ What works today, and what is still missing or unverified.
   (empty, because this installation's own item data has no `<rent>` section and
   no such flag on any vehicle).  `defaults.items` repeats the whole section, so
   a dialog that falls back to it shows the same numbers.
+* **The medal rewards of the awards window** — `achievementsReward` is not a
+  placeholder: the section carries the crystal (bond) reward of every medal, keyed
+  by the *client's own* record ids (`common/dossiers2/custom/records.py`, read
+  with `ast` out of the installation - unpacked or from `scripts.pkg`), with the
+  published medal-bond schedule of 9.20.1 as the amount per tank tier and one
+  group per medal for the arena type the window asks for
+  (`server/game/achievements_reward.py`).  An installation whose scripts cannot
+  be read gets the disabled section instead, which the client answers with
+  "no reward" rather than a warning.  The section also rides in a
+  `catalog.json` export, so a server started from one keeps it.
 * **Trade-in** — `CMD_VEHICLE_TRADE_IN` (10016) trades an owned, sellable
   premium vehicle for another premium one: the new tank is charged minus
   `ceil(0.5 * <gold price of the old one>)`, the old one's non-stock modules,
@@ -207,10 +217,13 @@ What works today, and what is still missing or unverified.
   (`ItemsCache`, `EventsCache`, `SettingsCache`, `AccountValidator`).  One call
   is worth watching in that log: switching to the lobby has
   `ServiceChannelManager` ask the account entity for
-  `requestLastSysMessages`, a method that exists nowhere in the decompiled
-  client - the bridge already answers the *base* side with a logged no-op (see
-  `client_mod/.../account_proxy.py`), and the entity side is a one-line stub
-  away if the real client turns out to need it.
+  `requestLastSysMessages` - a method the entity really has
+  (`client_common/ClientChat.requestLastSysMessages`, mixed into the client's
+  `PlayerAccount`), which sends `base.chatCommandFromClient(...)` and is one of
+  the routine calls the bridge answers with a no-op (`_IGNORED_CALLS` in
+  `client_mod/.../account_proxy.py`; `WOTNY_VERBOSE=1` logs them).  The service
+  messages themselves do not need it: they reach the client through the
+  notification list and the chat actions of the account.
 * **The New Year space itself** (`spaces/h07_newyear_2015`) has to exist in the
   client's packages.  If a build ships another space name, change
   `server/game/events.py::NEW_YEAR_HANGAR_PATH` (the client's own
@@ -268,12 +281,7 @@ What works today, and what is still missing or unverified.
   Year vehicle discounts of the running event - there is no live server handing
   out personal discounts, boosters or a daily-mission shop, and the client does
   not carry a `goodies.xml` to build them from, so the shop's `goodies` section
-  holds exactly those offers.  `achievementsReward` travels as
-  `{'isEnabled': False, 'groups': {}, 'medals': {}}`: this installation's item
-  data has no per-group bonus or vehicle multiplier for the achievement crystals
-  the client would render, and `ShopRequester.getAchievementReward` returns
-  `None` for a disabled section (a half-filled one would only move the warning
-  into the window).
+  holds exactly those offers.
 * **Notifications are only what the event has to say.**  The mechanism is the
   server's own (a notification without a `promo_` prefix becomes a service
   channel message, see above), and the event uses it for its start and for every

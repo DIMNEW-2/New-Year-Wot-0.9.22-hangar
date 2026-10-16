@@ -22,8 +22,15 @@ from gui.mods.wotny import log
 #: account diff.  The lobby is shown once its answer has arrived.
 CMD_SYNC_DATA = 100
 
-#: ``ConnectionManager.checkClientServerVersions`` uses this to reject a client
-#: that does not match the server; a local server accepts anything.
+#: The base calls the client makes that a local server answers with a no-op:
+#: ``ConnectionManager.checkClientServerVersions`` uses ``requestToken`` to
+#: reject a client that does not match the server, the chat channel of the lobby
+#: sends its commands (``chatCommandFromClient``/``inviteCommand``/
+#: ``ackCommand``, see ``client_common/ClientChat``), the connection manager
+#: keeps the entity alive (``keepAliveFor``/``stopKeepingAlive``) and the client
+#: pushes its own properties (``sendPropertiesTo``/``setAction``).  None of them
+#: is forwarded to the local server - there is nothing to answer with - and none
+#: of them is a failure.
 _IGNORED_CALLS = ('requestToken', 'logStreamCorruption', 'sendPropertiesTo',
                   'keepAliveFor', 'stopKeepingAlive', 'chatCommandFromClient',
                   'inviteCommand', 'ackCommand', 'onClientDeath', 'setAction',
@@ -66,6 +73,18 @@ class RemoteServer(object):
     def __getattr__(self, name):
         if name.startswith('_'):
             raise AttributeError(name)
+        if name in _IGNORED_CALLS:
+            # Routine lobby traffic: the chat channel asks for the last
+            # service messages (``ClientChat.requestLastSysMessages`` ->
+            # ``base.chatCommandFromClient``), the connection manager keeps
+            # the entity alive and the client pushes its own properties.  A
+            # local server has nothing to answer with and nothing to fix, so
+            # these stay out of the log unless ``WOTNY_VERBOSE=1``.
+            def quietly_ignored(*args, **kwargs):
+                log.debug('ignored account base call %s%r', name, args)
+                return None
+
+            return quietly_ignored
 
         def ignored(*args, **kwargs):
             log.info('ignored account base call %s%r', name, args)

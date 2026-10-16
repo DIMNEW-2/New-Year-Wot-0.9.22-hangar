@@ -130,7 +130,8 @@ Go through this in one session and note for every line: **works** / **fails**
 
 26. The profile window opens and its **statistics** are the empty ones (see
     *What is expected to be empty* below), not an error dialog.
-27. The **awards** tab lists the achievements and medals of the client.
+27. The **awards** tab lists the achievements and medals of the client; a
+    medal's tooltip shows the crystals (bonds) it pays per tank tier.
 28. The badges page opens, shows the badges of the installation (a local
     account is awarded every badge the installation describes, so the page has
     something to show) and keeps the ones that are picked.
@@ -154,10 +155,12 @@ These are not bugs, they are what the server is:
 * **Battles do not start.**  There is no battle server, so "В бой!" reports a
   server error instead of queueing.  Nothing in the New Year event needs a
   battle.
-* **The shop's achievement-crystal section stays disabled.**  The reward field
-  the client renders next to the achievements travels as `isEnabled: False`,
-  because the installation's item data carries no per-group bonus or vehicle
-  multiplier for it; the window stays empty instead of erroring.
+* **The crystal (bond) rewards of the medals are the schedule of the build.**
+  The awards window shows what `server/game/achievements_reward.py` publishes:
+  the medal-bond table of 9.20.1 times one crystal, per tank tier, keyed by the
+  installation's own record ids.  That is the *published* schedule, not an
+  account's earnings - the local server awards no bonds in a battle, so the
+  counter itself stays at zero.
 * **Missions, promotions, friends, clans, platoons** - not implemented, and
   there is no live mission/promotion feed to show: the notification mechanism
   itself works (the event announces its start and every atmosphere level in the
