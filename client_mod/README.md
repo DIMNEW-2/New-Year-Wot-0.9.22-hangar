@@ -76,3 +76,7 @@ step) and install the resulting `mods/0.9.22.0.1/*.wotmod`.
 * **The mod is not loaded at all** — the game version folder must match exactly
   (`0.9.22.0.1`), and `res_mods/<version>/scripts/client/gui/mods/mod_wotny_local.py`
   has to be in place.
+
+`docs/testing.md` is the full checklist for a session in the game: what to try
+in which order, what is expected to be empty (the statistics, the battles), and
+which five things make a failure report actionable.

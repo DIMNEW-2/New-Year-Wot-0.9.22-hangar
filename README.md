@@ -101,7 +101,7 @@ it prints the layout it found (or every place it looked) instead of a traceback.
 | `server/loader.py`, `server/__main__.py` | finding the installation (unpacked or packed, nested folders), CLI (`serve`, `info`, `extract`, `inspect`) |
 | `client_mod/` | the in-client mod (bridge + fake login + account proxy) |
 | `tests/` | plain-Python test suite (`python3 tests/run_all.py --client …`) |
-| `docs/` | protocol notes and the event reference |
+| `docs/` | protocol notes, the event reference and `docs/testing.md` (the checklist for a run in the real client) |
 
 ## Tests
 
