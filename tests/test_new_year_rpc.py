@@ -23,7 +23,7 @@ from server.game import customization as c11n  # noqa: E402
 from server.game import items as items_module  # noqa: E402
 from server.game import ny_constants as nyc  # noqa: E402
 from server.game.new_year import NewYearError  # noqa: E402
-from server.game.events import EVENT_CLIENT_DATA, REWARD_SEASONS  # noqa: E402
+from server.game.events import ACTION_NOTIFY_TYPE, CMD_CHANGE_HANGAR, EVENT_CLIENT_DATA, REWARD_SEASONS  # noqa: E402
 from server.proto import py2_loads  # noqa: E402
 
 VEHICLE = items_module.ITEM_TYPES["vehicle"]
@@ -389,6 +389,99 @@ def test_a_collection_reward_hands_out_its_camouflages(runner: common.Runner) ->
             seasons.append(found.season)
     runner.equal(sorted(seasons), sorted(REWARD_SEASONS),
                  "one camouflage per season, and no season twice")
+
+def test_a_level_up_announces_itself(runner: common.Runner) -> None:
+    """Raising the tree sends a line into the client's service channel.
+
+    A decoration that raises the atmosphere level marks its result with
+    ``NY_LEVEL_UP`` (``NewYearEvent._set_level``); the answer that raised the
+    level then travels with the notification list in the plain ``eventsData``
+    key, which ``Account.__synchronizeEventNotifications`` diffs against the list
+    it cached - so only the new message is shown, and every later answer repeats
+    the whole list so the old messages are never reported again.
+    """
+    client, state = _client(runner)
+    event = state.new_year
+    catalog = state.catalog.new_year
+    client.add_toys(sorted(catalog.toys))
+
+    def raise_level():
+        """Fill the best decoration of every empty slot until the level rises."""
+        for slot in catalog.slots:
+            candidates = [toy for toy in catalog.toys.values() if toy.type == slot.type]
+            if not candidates or event.state.slots[slot.id] != nyc.INVALID_TOY_ID:
+                continue
+            toy = max(candidates, key=lambda toy: (toy.atmosphere, -toy.id))
+            before = event.state.level
+            response = client.command(cmd.CMD_NEW_YEAR_SLOT_FILL, (slot.id, toy.id, 0))
+            runner.equal(response.code, cmd.RES_SUCCESS, "fillSlot accepted")
+            merged = {}
+            for diff in response.diffs:
+                merged.update(diff)
+            if event.state.level > before:
+                return merged
+        return None
+
+    first = raise_level()
+    runner.check(first is not None, "the tree reached a new level")
+    level = event.state.level
+    runner.check(level > 1, "the level rose above the initial one (%d)" % level)
+    runner.check("eventsData" in first, "the answer announces the level")
+    runner.check(("eventsData", "_r") not in first,
+                 "and does not replace the events data the update carries")
+    blob = first["eventsData"]
+    notifications = py2_loads(zlib.decompress(blob[EVENT_CLIENT_DATA["NOTIFICATIONS"]]))
+    runner.check(blob[EVENT_CLIENT_DATA["NOTIFICATIONS_REV"]],
+                 "the list travels with its revision")
+    types = [entry["type"] for entry in notifications]
+    runner.check(ACTION_NOTIFY_TYPE in types, "the level-up message is there")
+    message = notifications[-1]
+    runner.equal(message["type"], ACTION_NOTIFY_TYPE, "a service-channel message")
+    runner.check(set(("type", "text", "data", "requiredTokens")) <= set(message),
+                 "shaped the way NotificationItem reads it")
+    runner.check(any(str(level) in text for text in message["text"].values()),
+                 "the text names the new level %d: %r" % (level, message["text"]))
+    runner.check(CMD_CHANGE_HANGAR in types,
+                 "the hangar notification of the full sync stays in the list")
+    first_texts = [dict(entry["text"]) for entry in notifications]
+
+    # Another level-up repeats the *whole* list (the client diffs it), with the
+    # messages it already knows unchanged and one new entry at the end.
+    second = raise_level()
+    if second is not None:
+        runner.check("eventsData" in second, "the next level announces itself too")
+        blob = second["eventsData"]
+        notifications = py2_loads(zlib.decompress(blob[EVENT_CLIENT_DATA["NOTIFICATIONS"]]))
+        runner.equal(len(notifications), len(first_texts) + 1, "exactly one message was added")
+        runner.equal([dict(entry["text"]) for entry in notifications[:-1]], first_texts,
+                     "the messages of the earlier levels did not change")
+        runner.check(any(str(event.state.level) in text
+                         for text in notifications[-1]["text"].values()),
+                     "the new message names the new level")
+
+    # Every answer that does *not* announce anything stays quiet, and so does the
+    # whole server with ``--no-announce`` (``events.service_messages``).
+    toys = dict(event.state.inventory_toys)
+    quiet = []
+    for slot in catalog.slots:
+        candidates = [toy for toy in catalog.toys.values() if toy.type == slot.type]
+        if not candidates or event.state.slots[slot.id] != nyc.INVALID_TOY_ID:
+            continue
+        toy = max(candidates, key=lambda toy: (toy.atmosphere, -toy.id))
+        response = client.command(cmd.CMD_NEW_YEAR_SLOT_FILL, (slot.id, toy.id, 0))
+        merged = {}
+        for diff in response.diffs:
+            merged.update(diff)
+        if event.state.level == level:
+            quiet.append(merged)
+    runner.check(all("eventsData" not in diff for diff in quiet),
+                 "an answer without a level-up carries no notification list")
+
+    state.events.service_messages = False
+    silent = raise_level()
+    runner.check(silent is None or "eventsData" not in silent,
+                 "with the service messages switched off nothing is announced")
+
 
 
 def test_state_can_be_saved_and_restored(runner: common.Runner) -> None:

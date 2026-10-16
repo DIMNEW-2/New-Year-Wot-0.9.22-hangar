@@ -25,9 +25,16 @@ plain Python 2 protocol-2 pickles.
 
 `code` is the client's own `AccountCommands` value (`100` sync, `151`–`158` and
 `306`/`10015` the barracks, `116`–`119` the appearance window, `503`–`508` and
-`600` the profile, `800` the badges, `20161`–`20169` the New Year commands, `300`
-shop sync, …); `args` is a tuple because the mod sends `len(args)` values of the
-matching `doCmd*` helper.
+`600` the profile, `800` the badges, `10016` trade-in, `10017` the WGMBalance
+rows, `20161`–`20169` the New Year commands, `300` shop sync, …); `args` is a
+tuple because the mod sends `len(args)` values of the matching `doCmd*` helper.
+
+The shop and wallet helpers of `client/account_helpers`:
+
+| code | `args` | answer |
+| --- | --- | --- |
+| `CMD_VEHICLE_TRADE_IN` (10016) | `IntArr [rev, vehInvID, vehCD, flags, tmanCost]` | the traded-off tank is the *old* one and `vehCD` the new one (`Shop.tradeInVehicle`); the answer charges the new price minus `ceil(0.5 * <gold price of the old one>)` and carries `ext['vehInvID']` of the new tank.  Refusals: `vehicle_not_found_in_inventory`, `invalid_vehicle`, `vehicle_cannot_trade_in`, `vehicle_cannot_trade_off`, `not_enough_space`; fewer than three arguments are `RES_WRONG_ARGS` |
+| `CMD_QUERY_BALANCE_INFO` (10017) | `Str ''` (`doCmdStr('')`) | `ext` *is* the row list `WGMBalanceInfoRequester` walks: four rows of `{'currency_code': 'gold'|'credits', 'class': {'is_paid': bool}, 'amount': int}`, the earned pair being the wallet and the purchased pair zero |
 
 The barracks commands come from `client/account_helpers/Inventory.py`
 (`dismissTankman`, `addTankmanSkill`, …) and `client_recycle_bin.py`
@@ -95,6 +102,29 @@ the stream, if any.
   `EVENT_CLIENT_DATA` (`QUEST` 3, `ACTION` 1, `INGAME_EVENTS` 7,
   `NOTIFICATIONS` 9, …).  The notification list is only sent with a full sync:
   the client reports every entry it receives as freshly added, and a repeated
-  `cmd_change_hangar` reloads the hangar space.
+  `cmd_change_hangar` reloads the hangar space.  A notification *without* a
+  `cmd_`/`promo_` prefix becomes a message of the service channel
+  (`SystemMessagesInterface` → `ActionNotificationFormatter`, which reads
+  `message['type']` as its icon and wants `message['state']`), so the event
+  announces itself and every atmosphere level that way - the level-up rides in
+  the plain `NOTIFICATIONS` key of that very diff (the client diffs the list it
+  knows against the one it receives), a `promo_` notification is never sent
+  because the client would open a browser window for it.
+* `goodies` travels twice: the *definitions* sit in the shop cache
+  (`goodies`/`prices`/`notInShop` and again inside `defaults`) and the offers an
+  account *holds* in `('goodies', '_r')` as
+  `{'goodies': {goodieID: (state, finishTime, count)}}`, which is the section
+  `ClientGoodies` replaces its whole cache with.
 * New Year tokens are `(expiry, count)` pairs; the client moves the event ones
   into its own box/chest/discount caches and strips them from the token diff.
+* `cache` carries the flags the helpers keep there: `mayConsumeWalletResources`
+  (`Stats.synchronize`; a missing one leaves a gold purchase refused as
+  `WALLET_NOT_AVAILABLE`), `vehsLock` (`Inventory.synchronize` — the lock of
+  every locked vehicle, keyed by inventory id) and `SPA` (the dossier paths
+  written by `CMD_SET_DOSSIER_FIELD`).
+* A dossier answer is a compact descriptor built by
+  `server/game/dossier.py`: the header, then one size per block in layout order
+  and the block payloads.  `CMD_SYNC_DOSSIERS` (600) streams them (a `stream`
+  frame *after* its `RES_STREAM` response), every other request puts the
+  descriptor in `ext`; `CMD_SELECT_BADGES` (800) answers only `(resultID,
+  errorCode)` and publishes the selection in `diff['badges']`.

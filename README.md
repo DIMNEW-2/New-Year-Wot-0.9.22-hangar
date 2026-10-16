@@ -115,14 +115,20 @@ same bridge the mod uses).
 
 ## Status
 
-Implemented: catalogue and garage, account sync, the appearance window (the
-customization depot, the outfits and the four commands 116–119), the barracks
-(skills, retraining, roles, passports, crew experience, dismiss/restore through
-the recycle bin), the profile (dossiers, the vehicle dossier cache, player info,
-ratings, badges, dossier fields), New Year event (toys, slots, crafting, boxes,
-chests, discounts, tankwomen), event quests/actions, the New Year hangar
-notification, the socket bridge and the client mod.
+Implemented: catalogue and garage, account sync, the shop cache and its stream
+(every priced item, the appearance price factors, the not-in-shop lists, the
+trade-in configuration), buying and selling vehicles/items, slots and berths,
+trade-in of a premium vehicle, the wallet (exchange, premium, free experience,
+research, the WGMBalance rows), the appearance window (the customization depot,
+the outfits and the four commands 116–119), the barracks (skills, retraining,
+roles, passports, crew experience, dismiss/restore through the recycle bin), the
+profile (dossiers, the vehicle dossier cache, player info, ratings, badges,
+dossier fields), New Year event (toys, slots, crafting, boxes, chests, the
+personal vehicle discounts, tankwomen), event quests/actions and the
+service-channel notifications, the New Year hangar notification, the socket
+bridge and the client mod.
 
-Known gaps are tracked in `docs/status.md` — most notably the shop stream
-(prices), battles (out of scope) and the parts of the mod that can only be
-verified inside a real client.
+Known gaps are tracked in `docs/status.md` — most notably the parts of the mod
+that can only be verified inside a real client, the data only a live server has
+(battle results, missions and promotions) and battles themselves (out of
+scope).

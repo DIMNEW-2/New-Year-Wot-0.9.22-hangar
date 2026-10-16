@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from . import items as items_module
+from . import goodies as goodies_module
 from . import ny_constants as nyc
 from . import rewards as rewards_module
 from .rewards import REWARD_VEHICLE_LEVEL
@@ -871,7 +872,7 @@ class NewYearEvent:
         if self.goodies and definition is None:
             raise NewYearError("goodie %d is not an active offer" % (goodie_id,))
         self.state.variadic_discounts[variadic_discount_id] -= 1
-        self.state.goodies[goodie_id] = (1, 0, 1)  # GOODIE_STATE.ACTIVE
+        self.state.goodies[goodie_id] = (goodies_module.GOODIE_STATE_ACTIVE, 0, 1)
         return NewYearResult(
             diff={
                 "tokens": {

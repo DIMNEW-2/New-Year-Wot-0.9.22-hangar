@@ -12,7 +12,9 @@ reads comes from there:
 * ``EVENT_CLIENT_DATA.ACTION`` - a *list* of action dictionaries, each with an
   ``id``; the New Year action opens the event in the lobby,
 * ``EVENT_CLIENT_DATA.NOTIFICATIONS`` - a list of server notifications; the
-  ``cmd_change_hangar`` one switches the hangar space to the New Year scene.
+  ``cmd_change_hangar`` one switches the hangar space to the New Year scene and
+  an unprefixed one (``ACTION_NOTIFY_TYPE``) becomes a message in the client's
+  service channel (see :meth:`EventDataBuilder.action_notification`).
 
 This module builds those payloads from the catalogue and the event state; the
 transport (account diff key ``eventsData`` or ``('eventsData', '_r')`` for a full
@@ -70,6 +72,18 @@ CMD_CHANGE_HANGAR_PREMIUM = "cmd_change_hangar_prem"
 CMD_CHANGE_HANGAR_AMBIENT = "cmd_change_hangar_ambient"
 CMD_CHANGE_HANGAR_MUSIC = "cmd_change_hangar_music"
 
+#: ``client/gui/scaleform/SystemMessagesInterface.__processNotifications``
+#: turns every notification whose type starts with neither ``cmd_`` nor
+#: ``promo_`` into a message of the player's service channel
+#: (``SCH_CLIENT_MSG_TYPE.ACTION_NOTIFY_TYPE``), which
+#: ``ActionNotificationFormatter`` renders into the ``actionBegin``/``actionEnd``
+#: template of the lobby.  A ``promo_`` notification instead opens a browser
+#: window (``PromoController._processPromo`` parses its payload as a URL), so the
+#: local server never sends one.
+ACTION_NOTIFY_TYPE = "action"
+PROMO_NOTIFICATION_PREFIX = "promo_"
+CMD_NOTIFICATION_PREFIX = "cmd_"
+
 #: The New Year action of the event; the client's NY views are opened for it.
 NEW_YEAR_ACTION_ID = "ny18:action"
 NEW_YEAR_EVENT_TAG = "ny18"
@@ -82,6 +96,28 @@ NY_STATE_FINISHED = 3
 
 #: Seconds a New Year campaign lasts (the event ran for a bit over a month).
 EVENT_DURATION = 30 * 24 * 3600
+
+
+#: The order of the languages a text is tried in.  ``helpers.getLocalizedData``
+#: (``client/helpers/__init__.py``) looks up ``getClientLanguage()`` first, then
+#: ``constants.DEFAULT_LANGUAGE`` - which is ``cn`` for the Chinese build this
+#: server runs against - and finally takes whatever the dictionary holds, so the
+#: Chinese text is also what a client of another language falls back to.
+LANGUAGES = ("cn", "ru", "en")
+
+
+def localized(cn: str = "", ru: str = "", en: str = "") -> Dict[str, str]:
+    """The text of a server message, by client language.
+
+    A message of the *server* travels as a dictionary of languages instead of
+    one string (``helpers.getLocalizedData`` of the client picks the entry), and
+    an empty text is left out: the client skips a notification with no text.
+    """
+    result = {}
+    for language, text in zip(LANGUAGES, (cn, ru, en)):
+        if text:
+            result[language] = text
+    return result
 
 
 def _blob(payload) -> bytes:
@@ -107,6 +143,12 @@ class EventDataBuilder:
         #: banks decide the event names, so they are off unless configured.
         self.hangar_ambient = ""
         self.hangar_music = ""
+        #: The service-channel messages the full sync announces (see
+        #: :meth:`action_notification`) and whether they are sent at all
+        #: (``python3 -m server --no-announce`` keeps them out of the client).
+        self.announcements: List[dict] = []
+        self.service_messages = True
+        self._announcement_ids: set = set()
 
     def set_new_year_state(self, state: int) -> None:
         """Switch the state of the event; the client picks it up on the next sync."""
@@ -316,6 +358,33 @@ class EventDataBuilder:
             json.dumps({"hangar": path, "visibilityMask": "FFFFFFFF"}),
         )
 
+    def action_notification(self, text: dict, event_type: str = ACTION_NOTIFY_TYPE) -> dict:
+        """One service-channel notification (``ACTION_NOTIFY_TYPE``).
+
+        The text travels as a dictionary of languages
+        (``helpers.getLocalizedData`` picks the one the client speaks), the
+        ``type`` is what ``ActionNotificationFormatter`` passes to the message
+        template as its icon source, and ``data`` only has to exist - the handler
+        of a non-``cmd_`` notification reads ``type`` and ``text`` alone
+        (``SystemMessagesInterface.__processNotifications``).
+        """
+        return self.notification(event_type, text.get("cn") or text.get("ru") or "",
+                                 text=text)
+
+    def announce(self, key: str, text: dict, event_type: str = ACTION_NOTIFY_TYPE) -> bool:
+        """Announce something once per campaign (keyed by ``key``).
+
+        ``True`` means this very call added an announcement - i.e. the answer
+        that provoked it has something new to tell the player and should carry
+        :meth:`notifications_diff`; ``False`` means the message was already sent
+        (or is switched off) and the client has seen it.
+        """
+        if not self.service_messages or key in self._announcement_ids:
+            return False
+        self._announcement_ids.add(key)
+        self.announcements.append(self.action_notification(text, event_type))
+        return True
+
     def notifications(self) -> List[dict]:
         """Server notifications - the New Year hangar scene in particular.
 
@@ -332,6 +401,8 @@ class EventDataBuilder:
             result.append(self.notification(CMD_CHANGE_HANGAR_AMBIENT, self.hangar_ambient))
         if self.hangar_music:
             result.append(self.notification(CMD_CHANGE_HANGAR_MUSIC, self.hangar_music))
+        if self.service_messages:
+            result.extend(self.announcements)
         return result
 
     # -- payloads --------------------------------------------------------
@@ -372,6 +443,36 @@ class EventDataBuilder:
             data.pop(EVENT_CLIENT_DATA["NOTIFICATIONS"], None)
             data.pop(EVENT_CLIENT_DATA["NOTIFICATIONS_REV"], None)
         return data
+
+    def notifications_diff(self) -> Dict[str, dict]:
+        """The ``eventsData`` section that tells the client of a new message.
+
+        An *update* may carry the notification list in the plain
+        ``diff['eventsData']`` form (and not under ``('eventsData', '_r')``,
+        which the client reads as "all of these are new" and would repeat every
+        message of the full sync): ``Account._update`` calls
+        ``__synchronizeEventNotifications`` *before* ``__synchronizeCacheDict``
+        and that helper pops ``NOTIFICATIONS``/``NOTIFICATIONS_REV`` out of the
+        dictionary, so nothing else tries to merge them as blobs.  The client
+        then compares the list with the one it cached - ``NotificationItem``
+        hashes the type, the texts, the data and the required tokens - and hands
+        only the additions to its listeners (``SystemMessagesInterface``), which
+        is what makes a New Year level-up show up in the service channel right
+        in the answer that raised the level.
+
+        The list travels whole, not as the single new entry: the client replaces
+        its cache with what arrives and diffs it against the previous list, so
+        sending every notification (the old ones included) is what keeps old
+        messages from being reported again.
+        """
+        if not self.service_messages:
+            return {}
+        return {
+            "eventsData": {
+                EVENT_CLIENT_DATA["NOTIFICATIONS"]: _blob(self.notifications()),
+                EVENT_CLIENT_DATA["NOTIFICATIONS_REV"]: _blob(self._revision()),
+            }
+        }
 
     def events_data_diff(self) -> Dict[int, bytes]:
         """The ``eventsData`` payloads of an incremental update.
@@ -442,7 +543,10 @@ def collection_reward_customizations(catalogue, setting: str) -> List[dict]:
 
 
 __all__ = [
+    "ACTION_NOTIFY_TYPE",
     "CHEST_QUESTS",
+    "CMD_NOTIFICATION_PREFIX",
+    "PROMO_NOTIFICATION_PREFIX",
     "REWARD_SEASONS",
     "collection_reward_customizations",
     "CMD_CHANGE_HANGAR",
@@ -454,8 +558,10 @@ __all__ = [
     "EVENT_TYPE_BATTLE_QUEST",
     "EVENT_TYPE_TOKEN_QUEST",
     "EventDataBuilder",
+    "localized",
     "NEW_YEAR_ACTION_ID",
     "NEW_YEAR_EVENT_TAG",
+    "LANGUAGES",
     "NEW_YEAR_HANGAR_PATH",
     "NY_STATE_FINISHED",
     "NY_STATE_IN_PROGRESS",

@@ -28,6 +28,7 @@ diff carries ``prevRev``/``rev`` and only the changed leaves.
 
 from __future__ import annotations
 
+import logging
 import random
 import time
 from dataclasses import dataclass, field
@@ -42,10 +43,14 @@ from ..game import tankmen as tankmen_module
 from ..game import vehicle_descr as descr_module
 from ..game import catalog as catalog_module
 from ..game import customization as c11n_types
+from ..game import dossier as dossier_module
 from . import customization as customization_module
 from ..game.catalog import Catalog, VehicleType
 from ..game import events as events_module
+from ..game import goodies as goodies_module
 from ..game.events import EventDataBuilder
+
+LOG = logging.getLogger("wotny.state")
 
 #: ``GUI_ITEM_TYPE`` indexes of the client (``gui.shared.gui_items``).
 VEHICLE = items_module.GUI_ITEM_TYPE.VEHICLE
@@ -243,6 +248,10 @@ class AccountState:
         #: ``diff['badges']``: the badges the profile shows
         #: (``CMD_SELECT_BADGES``; see :mod:`server.account_rpc.profile`).
         self.badges: List[int] = []
+        #: ``playerBadges`` of the account dossier: ``{badgeID: time earned}``.
+        #: This is the *only* source of "was this badge earned" the client has
+        #: (``Badge.isAchieved``), see :meth:`award_badges`.
+        self.achieved_badges: Dict[int, int] = {}
         #: ``cache.SPA``: one value per dossier path, as written by
         #: ``CMD_SET_DOSSIER_FIELD``.
         self.dossier_fields: Dict[str, int] = {}
@@ -252,12 +261,19 @@ class AccountState:
         #: The vehicles the New Year boxes and chests hand out (built from the
         #: client's own vehicle catalogue, see :mod:`server.game.rewards`).
         self.vehicle_chooser = rewards_module.VehicleRewardChooser(catalog)
+        #: The personal offers of the event: one New Year vehicle discount per
+        #: vehicle and atmosphere level (see :mod:`server.game.goodies`).  The
+        #: same table is published in the shop cache - where the client reads
+        #: the definitions - and handed to the event, which only accepts the id
+        #: of a level's own range.
+        self.goodie_table = goodies_module.new_year_vehicle_discounts(catalog)
         self.new_year = ny_module.NewYearEvent(
             catalog.new_year,
             rng=self.rng,
             tankmen=tankman_factory,
             vehicles=self.vehicle_chooser,
             owned_vehicles=self.owned_vehicle_comp_descrs,
+            goodies=self.goodie_table.definitions,
         )
         self.revision = 1
         self._notifications: List[dict] = []
@@ -272,6 +288,7 @@ class AccountState:
         catalog: Catalog,
         tankmen_configs: Dict[str, tankmen_module.NationConfig] = None,
         garage_mode: str = GARAGE_RESEARCHABLE,
+        achieved_badges: Sequence[int] = None,
         **kwargs,
     ) -> "AccountState":
         """A ready-to-play account: a garage, a crew and the event switched on."""
@@ -280,6 +297,13 @@ class AccountState:
             state.tankman_factory = tankmen_module.TankmanFactory(tankmen_configs, state.rng)
             state.new_year.tankmen = state.tankman_factory
         state.grant_garage(mode=garage_mode)
+        # ``None`` awards every badge the installation describes: a local
+        # account cannot earn one (no battle, no ranked season), and an empty
+        # badge page would be less useful than the installation's own table.
+        # ``award_badges`` takes an explicit list as well, which is what an
+        # account started from a hand-written file uses (see
+        # :meth:`AccountState.award_badges`).
+        state.award_badges(achieved_badges)
         state.start_new_year()
         return state
 
@@ -592,6 +616,52 @@ class AccountState:
         self.new_year.state.state = state
         self.new_year.stock()
         self.revision += 1
+        self.announce_new_year()
+
+    def announce_new_year(self) -> bool:
+        """Announce the event in the client's service channel.
+
+        A notification whose type starts with neither ``cmd_`` nor ``promo_``
+        becomes a message of the lobby's service channel
+        (``SystemMessagesInterface.__processNotifications`` ->
+        ``ActionNotificationFormatter``), which is how the live server announced
+        a running event; the texts are the local server's own and travel by
+        language (``helpers.getLocalizedData``).  The announcement rides in the
+        notification list of the *full* sync only - the client treats any
+        notification list of an update as freshly added, so repeating it there
+        would re-open the space and the message on every diff.
+        """
+        announced = self.events.announce(
+            "ny18:started:%s" % self.new_year.state.state,
+            events_module.localized(
+                cn="新年攻势：收集玩具、开启箱子并获得坦克折扣！",
+                ru="Новогоднее наступление: собирайте игрушки, открывайте "
+                   "ящики и получайте скидки на технику!",
+                en="New Year Offensive: collect toys, open boxes and claim "
+                   "vehicle discounts!",
+            ),
+        )
+        LOG.info("the event announced itself (state %s)", self.new_year.state.state)
+        return announced
+
+    def announce_new_year_level(self, level: int) -> bool:
+        """Announce the atmosphere level the tree just reached.
+
+        ``NewYearResult.notifications`` carries ``NY_LEVEL_UP`` whenever a
+        decoration raised the level (``NewYearEvent._set_level``); the level-up
+        window itself is opened by the client (``_NewYearController`` reacts to
+        the new ``level`` in the diff), so what the server adds is the line in
+        the service channel - one message per level, never twice.
+        """
+        level = int(level)
+        return self.events.announce(
+            "ny18:level:%d" % level,
+            events_module.localized(
+                cn="新年树升到了 %d 级！" % level,
+                ru="Новогодняя ёлка выросла до %d уровня!" % level,
+                en="Your New Year tree reached level %d!" % level,
+            ),
+        )
 
     def sync_tokens(self) -> Dict[str, Tuple[Optional[int], int]]:
         """Merge the event tokens into the account token table."""
@@ -649,14 +719,60 @@ class AccountState:
                 continue
         return result
 
+    # ------------------------------------------------------------------
+    # The profile: the account dossier, its badges and the vehicle locks
+    # ------------------------------------------------------------------
+    def award_badges(self, badge_ids: Sequence[int] = None, when: int = None) -> None:
+        """Mark badges of the installation as earned.
+
+        A badge is earned in the live game by a ranked season, a personal
+        mission or a global map result - none of which can happen here, because
+        this server has no battles.  ``None`` therefore awards every badge the
+        catalogue knows (``item_defs/badges.xml``, see
+        :mod:`server.game.badges`), so the badge page of the client is usable;
+        pass a sequence of ids for a smaller set and an empty one for none.
+        ``when`` is the time the badge was earned and defaults to the creation
+        time of the account.
+        """
+        if badge_ids is None:
+            badge_ids = sorted(self.catalog.badges)
+        stamps = int(when if when is not None else self.created_at)
+        for badge_id in badge_ids:
+            self.achieved_badges[int(badge_id)] = stamps
+
+    def account_dossier(self) -> bytes:
+        """``stats['dossier']`` - the compact descriptor of the account dossier.
+
+        The descriptor is the client's own format (:mod:`server.game.dossier`):
+        the ``total`` block carries the date of the account (the profile window
+        shows it) and ``playerBadges`` the badges it earned.  Every statistics
+        block stays empty - this account never fought a battle, and its dossier
+        says so.
+        """
+        return dossier_module.build(dossier_module.ACCOUNT, {
+            dossier_module.TOTAL_BLOCK: dossier_module.pack_total(int(self.created_at)),
+            dossier_module.BADGES_BLOCK: dossier_module.pack_badges(self.achieved_badges),
+        })
+
+    def vehicle_locks(self) -> Dict[int, int]:
+        """``cache['vehsLock']`` - the lock of every locked vehicle.
+
+        The client merges this section into its per-vehicle ``lock`` entry
+        (``Inventory.synchronize`` -> ``synchronizeDicts``) and reloads the
+        hangar and the tech tree from it (``CurrentVehicle``,
+        ``techtree/listeners``), so the values have the shape the ``inventory``
+        section publishes.  The live game locks a vehicle while it is in a
+        battle; only a lock that is really set on a garage entry travels here.
+        """
+        return {entry.inv_id: tuple(entry.lock) for entry in self.vehicles.values()
+                if int(entry.lock[0])}
+
     def _stats_diff(self) -> dict:
         return {
-            # ``stats['dossier']`` - the account dossier.  An empty descriptor is
-            # a *new* dossier for the client (``DossierBuilder.build('')`` packs
-            # the current version with every block zero sized and stamps the
-            # creation time), which is what an account without a single battle
-            # has to report.  See :mod:`server.account_rpc.profile`.
-            "dossier": b"",
+            # ``stats['dossier']``: the creation time of the account and the
+            # badges it earned, every statistic block empty (see
+            # :meth:`account_dossier`).
+            "dossier": self.account_dossier(),
             "slots": self.slots,
             "berths": self.berths,
             "freeXP": self.free_xp,
@@ -772,7 +888,17 @@ class AccountState:
             # The badges of the profile (``ClientBadges.synchronize``) and the
             # dossier fields (``Stats.synchronize`` -> ``cache['SPA']``).
             "badges": list(self.badges),
-            "cache": {"SPA": dict(self.dossier_fields)},
+            # ``Stats.synchronize`` reads these three out of ``cache``:
+            # ``SPA`` is the dossier paths ``CMD_SET_DOSSIER_FIELD`` wrote and
+            # ``vehsLock`` the lock of every vehicle.  ``mayConsumeWalletResources``
+            # is the flag the whole wallet hangs on (``StatsRequester
+            # .mayConsumeWalletResources`` defaults to *false*, which would leave
+            # ``WalletController`` syncing forever and refuse every spend), so the
+            # full sync publishes it with the ``serverStats`` field of the same
+            # name (``server/account_rpc/data.py``).
+            "cache": {"SPA": dict(self.dossier_fields),
+                      "vehsLock": self.vehicle_locks(),
+                      "mayConsumeWalletResources": True},
         }
 
     def incremental_diff(
@@ -813,7 +939,8 @@ class AccountState:
     def shop_builder(self) -> shop_module.ShopBuilder:
         """The shop cache builder of this installation (prices, revisions)."""
         if self._shop_builder is None:
-            self._shop_builder = shop_module.ShopBuilder(self.catalog)
+            self._shop_builder = shop_module.ShopBuilder(
+                self.catalog, goodies=self.goodie_table)
         return self._shop_builder
 
     def shop_payload(self) -> dict:
@@ -827,6 +954,42 @@ class AccountState:
     # ------------------------------------------------------------------
     # Items of the depot (shells, equipment, consumables, devices)
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Personal offers (the ``goodies`` section of the account)
+    # ------------------------------------------------------------------
+    def active_goodie_ids(self) -> List[int]:
+        """The ids of the goodies this account has (``('goodies', '_r')``)."""
+        return [int(uid) for uid in self.new_year.state.goodies]
+
+    def goodie_for_vehicle(self, compact_descr: int):
+        """The best offer on a vehicle this account owns, or ``None``.
+
+        ``ShopRequester.getPersonalVehicleDiscountPrice`` reads the same two
+        tables the same way (a definition of the shop cache, matched against the
+        ids of the account section), so the price the client shows and the price
+        this server charges come from one goodie.
+        """
+        return self.goodie_table.best_for_vehicle(
+            int(compact_descr), active=self.active_goodie_ids())
+
+    def consume_goodie(self, uid: int) -> Dict[int, list]:
+        """Use a goodie up and publish the account section without it.
+
+        A goodie whose counter reaches zero leaves the account
+        (``common/goodies/Goodies.remove``) - and that is what makes the client
+        drop the discount: ``ShopRequester.__personalDiscountsByTarget`` keeps
+        only the definitions whose id is still in the account's own goodies.
+        """
+        state = self.new_year.state
+        current = state.goodies.get(int(uid))
+        if current is not None:
+            remaining = int(current[2]) - 1
+            if remaining > 0:
+                state.goodies[int(uid)] = (int(current[0]), int(current[1]), remaining)
+            else:
+                state.goodies.pop(int(uid), None)
+        return self.new_year.goodies_diff()
+
     def item_count(self, item_type: int, compact_descr: int) -> int:
         return int(self.items.get(int(item_type), {}).get(int(compact_descr), 0))
 
@@ -1041,10 +1204,16 @@ class AccountState:
             # loot of this opening has to reach ``eventsData`` (see
             # ``EventDataBuilder.set_chest_loot``).
             self.events.set_chest_loot(result.chest_loot)
+        # ``NY_LEVEL_UP`` is the event telling the server the tree grew: the
+        # message goes to the service channel, and the caller publishes it with
+        # ``events.notifications_diff()`` (see ``announced`` below).
+        announced = ("NY_LEVEL_UP" in result.notifications
+                     and self.announce_new_year_level(self.new_year.state.level))
         return {
             "vehicles": sorted(set(self.vehicles) - before_vehicles),
             "tankmen": sorted(set(self.tankmen) - before_tankmen),
             "customizations": granted_items,
+            "announced": announced,
         }
 
     def granted_account_diff(self, granted: dict) -> dict:
@@ -1292,6 +1461,8 @@ class AccountState:
                 for inv_id, record in sorted(self.dismissed_tankmen.items())
             },
             "badges": list(self.badges),
+            "achievedBadges": {str(badge_id): int(when)
+                               for badge_id, when in sorted(self.achieved_badges.items())},
             "dossierFields": {path: int(value)
                               for path, value in sorted(self.dossier_fields.items())},
             "unlocks": sorted(self.unlocks),
@@ -1365,6 +1536,8 @@ class AccountState:
             for inv_id, record in (payload.get("dismissedTankmen") or {}).items()
         }
         state.badges = [int(badge) for badge in payload.get("badges") or ()]
+        state.achieved_badges = {int(badge_id): int(when)
+                                 for badge_id, when in (payload.get("achievedBadges") or {}).items()}
         state.dossier_fields = {str(path): int(value)
                                 for path, value in (payload.get("dossierFields") or {}).items()}
         state.unlocks = set(payload.get("unlocks") or ())

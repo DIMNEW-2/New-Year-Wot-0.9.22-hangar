@@ -39,6 +39,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from . import c11n_constants as constants
 from . import c11n_outfit as outfit_module
 from . import items as items_module
+from . import ny_constants as nyc
 from .defs import DefsSource
 
 #: Re-exported: the client's ``CustomizationType`` / ``SeasonType`` / ``ItemTags``
@@ -428,6 +429,203 @@ class CustomizationCatalog:
 
 
 # ---------------------------------------------------------------------------
+# the legacy appearance tables of the shop cache
+# ---------------------------------------------------------------------------
+#: The appearance items of the *first* customization system never left the
+#: installation: ``item_defs/vehicles/common/customization.xml`` holds the
+#: shared ones (ids 5001..65535) and ``item_defs/vehicles/<nation>/
+#: customization.xml`` the national ones (ids 1..5000), read per nation exactly
+#: like ``items.vehicles.Cache.customization`` does.  The emblems of a player
+#: are the groups of ``item_defs/vehicles/common/player_emblems.xml``.
+LEGACY_COMMON_PATH = "vehicles/common/customization.xml"
+LEGACY_NATION_PATH = "vehicles/%s/customization.xml"
+LEGACY_EMBLEMS_PATH = "vehicles/common/player_emblems.xml"
+
+#: The two ``idsRange`` arguments of ``_readCustomization``: the common file is
+#: read with the high range, a nation's own one with the low range.
+LEGACY_COMMON_IDS = (5001, 65535)
+LEGACY_NATION_IDS = (1, 5000)
+
+
+@dataclass
+class LegacyCustomization:
+    """The legacy appearance tables of the shop cache.
+
+    ``ShopRequester`` reads six tables that belong to the first customization
+    system - the camouflages, inscriptions and player emblems with their
+    ``priceFactor`` (the multiplier the client applies to the base price of the
+    item) and the ones the client's own data keeps out of the shop::
+
+        camouflagePriceFactors[nationID][camouflageID]      -> factor
+        notInShopCamouflages[nationID]                      -> {camouflageID}
+        inscriptionGroupPriceFactors[nationID][groupName]    -> factor
+        notInShopInscriptionGroups[nationID]                -> {groupName}
+        playerEmblemGroupPriceFactors[groupName]            -> factor
+        notInShopPlayerEmblemGroups                         -> {groupName}
+
+    Every one of them is collected by the client's own item data
+    (``common/items/vehicles.py::_readCustomization``/``_readPlayerEmblems``
+    fill ``items.pricesToCollect``), so the numbers here are the installation's
+    and not the server's guess.  The keys are the client's own - camouflage ids
+    and group names, *not* compact descriptors - because that is how the
+    requesters index them.
+    """
+
+    camouflage_price_factors: Dict[int, Dict[int, float]] = field(default_factory=dict)
+    not_in_shop_camouflages: Dict[int, set] = field(default_factory=dict)
+    inscription_group_price_factors: Dict[int, Dict[str, float]] = field(default_factory=dict)
+    not_in_shop_inscription_groups: Dict[int, set] = field(default_factory=dict)
+    player_emblem_group_price_factors: Dict[str, float] = field(default_factory=dict)
+    not_in_shop_player_emblem_groups: set = field(default_factory=set)
+
+    # -- accessors of the shop cache ------------------------------------
+    def camouflage_factors(self, size: int) -> List[dict]:
+        """``camouflagePriceFactors``: one dictionary per nation id."""
+        return [dict(self.camouflage_price_factors.get(nation_id, {})) for nation_id in range(size)]
+
+    def camouflage_hiddens(self, size: int) -> List[set]:
+        return [set(self.not_in_shop_camouflages.get(nation_id, ())) for nation_id in range(size)]
+
+    def inscription_factors(self, size: int) -> List[dict]:
+        return [dict(self.inscription_group_price_factors.get(nation_id, {}))
+                for nation_id in range(size)]
+
+    def inscription_hiddens(self, size: int) -> List[set]:
+        return [set(self.not_in_shop_inscription_groups.get(nation_id, ()))
+                for nation_id in range(size)]
+
+    def emblem_factors(self) -> Dict[str, float]:
+        return dict(self.player_emblem_group_price_factors)
+
+    def emblem_hiddens(self) -> set:
+        return set(self.not_in_shop_player_emblem_groups)
+
+    @property
+    def camo_count(self) -> int:
+        return sum(len(table) for table in self.camouflage_price_factors.values())
+
+    @property
+    def emblem_group_count(self) -> int:
+        return len(self.player_emblem_group_price_factors)
+
+    # -- the catalogue file ---------------------------------------------
+    def to_json(self) -> dict:
+        return {
+            "camouflages": [
+                {"nation": nation_id,
+                 "factors": {str(camo_id): factor for camo_id, factor in sorted(table.items())},
+                 "notInShop": sorted(self.not_in_shop_camouflages.get(nation_id, ()))}
+                for nation_id, table in sorted(self.camouflage_price_factors.items())
+            ],
+            "inscriptionGroups": [
+                {"nation": nation_id,
+                 "factors": {name: factor for name, factor in sorted(table.items())},
+                 "notInShop": sorted(self.not_in_shop_inscription_groups.get(nation_id, ()))}
+                for nation_id, table in sorted(self.inscription_group_price_factors.items())
+            ],
+            "emblemGroups": {
+                "factors": {name: factor for name, factor
+                            in sorted(self.player_emblem_group_price_factors.items())},
+                "notInShop": sorted(self.not_in_shop_player_emblem_groups),
+            },
+        }
+
+    @classmethod
+    def from_json(cls, payload: dict) -> "LegacyCustomization":
+        payload = payload or {}
+        camouflages: Dict[int, Dict[int, float]] = {}
+        hidden_camouflages: Dict[int, set] = {}
+        for entry in payload.get("camouflages") or ():
+            nation_id = int(entry["nation"])
+            camouflages[nation_id] = {int(camo_id): float(factor)
+                                      for camo_id, factor in (entry.get("factors") or {}).items()}
+            hidden_camouflages[nation_id] = {int(camo_id)
+                                             for camo_id in entry.get("notInShop") or ()}
+        inscriptions: Dict[int, Dict[str, float]] = {}
+        hidden_inscriptions: Dict[int, set] = {}
+        for entry in payload.get("inscriptionGroups") or ():
+            nation_id = int(entry["nation"])
+            inscriptions[nation_id] = {str(name): float(factor)
+                                       for name, factor in (entry.get("factors") or {}).items()}
+            hidden_inscriptions[nation_id] = {str(name)
+                                             for name in entry.get("notInShop") or ()}
+        emblems = payload.get("emblemGroups") or {}
+        return cls(
+            camouflage_price_factors=camouflages,
+            not_in_shop_camouflages=hidden_camouflages,
+            inscription_group_price_factors=inscriptions,
+            not_in_shop_inscription_groups=hidden_inscriptions,
+            player_emblem_group_price_factors={str(name): float(factor)
+                                               for name, factor in (emblems.get("factors") or {}).items()},
+            not_in_shop_player_emblem_groups={str(name) for name in emblems.get("notInShop") or ()},
+        )
+
+
+def _read_camouflages(section, nation_id: int, ids_range: Tuple[int, int],
+                      tables: LegacyCustomization) -> None:
+    """``_readCamouflage``: the id, its price factor and its shop flag."""
+    factors = tables.camouflage_price_factors.setdefault(nation_id, {})
+    hidden = tables.not_in_shop_camouflages.setdefault(nation_id, set())
+    container = section.subsection("camouflages")
+    if container is None:
+        return
+    for camouflage in container.children:
+        camo_id = camouflage.value_int("id", -1)
+        if not ids_range[0] <= camo_id <= ids_range[1]:
+            continue
+        factors[camo_id] = camouflage.value_float("priceFactor", 0.0)
+        if camouflage.value_bool("notInShop", False):
+            hidden.add(camo_id)
+
+
+def _read_inscription_groups(section, nation_id: int,
+                             tables: LegacyCustomization) -> None:
+    """``_readPlayerInscriptions``: one group per child of ``<inscriptions>``."""
+    container = section.subsection("inscriptions")
+    if container is None:
+        return
+    factors = tables.inscription_group_price_factors.setdefault(nation_id, {})
+    hidden = tables.not_in_shop_inscription_groups.setdefault(nation_id, set())
+    for group in container.children:
+        factors[group.name] = group.value_float("priceFactor", 0.0)
+        if group.value_bool("notInShop", False):
+            hidden.add(group.name)
+
+
+def load_legacy_customization(source: DefsSource, nations: Sequence[str]) -> LegacyCustomization:
+    """Collect the legacy appearance tables of the installation.
+
+    The common file is read for *every* nation (its items are shared, and that
+    is how ``items.vehicles.Cache.customization(nationID)`` builds the tables),
+    a nation's own file only for that nation.  A nation without any of the files
+    simply keeps empty tables - the shop cache then publishes empty dictionaries
+    for it, which is what a requester that indexes the array expects.
+    """
+    tables = LegacyCustomization()
+    emblems = source.read_section(LEGACY_EMBLEMS_PATH) if source.has(LEGACY_EMBLEMS_PATH) else None
+    if emblems is not None:
+        for group in emblems.children:
+            tables.player_emblem_group_price_factors[group.name] = group.value_float("priceFactor", 0.0)
+            if group.value_bool("notInShop", False):
+                tables.not_in_shop_player_emblem_groups.add(group.name)
+    common = source.read_section(LEGACY_COMMON_PATH) if source.has(LEGACY_COMMON_PATH) else None
+    for nation in nations:
+        nation_id = nyc.NATION_INDICES.get(nation)
+        if nation_id is None:
+            continue
+        if common is not None:
+            _read_camouflages(common, nation_id, LEGACY_COMMON_IDS, tables)
+            _read_inscription_groups(common, nation_id, tables)
+        path = LEGACY_NATION_PATH % nation
+        if not source.has(path):
+            continue
+        section = source.read_section(path)
+        _read_camouflages(section, nation_id, LEGACY_NATION_IDS, tables)
+        _read_inscription_groups(section, nation_id, tables)
+    return tables
+
+
+# ---------------------------------------------------------------------------
 # small readers of the item sections
 # ---------------------------------------------------------------------------
 def _read_usages(entry) -> Tuple[Tuple[int, int], ...]:
@@ -529,6 +727,12 @@ __all__ = [
     "C11nItem",
     "CustomizationCatalog",
     "ITEM_FOLDERS",
+    "LEGACY_COMMON_IDS",
+    "LEGACY_COMMON_PATH",
+    "LEGACY_EMBLEMS_PATH",
+    "LEGACY_NATION_IDS",
+    "LEGACY_NATION_PATH",
+    "LegacyCustomization",
     "LAYOUT_TYPES",
     "PRICE_GROUPS_PATH",
     "PriceGroup",
@@ -550,5 +754,6 @@ __all__ = [
     "TYPE_PAINT",
     "TYPE_STYLE",
     "item_type_of",
+    "load_legacy_customization",
     "make_int_descr",
 ]

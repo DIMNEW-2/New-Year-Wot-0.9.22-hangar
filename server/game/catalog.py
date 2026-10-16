@@ -17,6 +17,8 @@ from . import badges as badges_module
 from . import items as items_module
 from . import ny_constants as nyc
 from . import tankmen as tankmen_module
+from .customization import (CustomizationCatalog, LegacyCustomization,
+                             load_legacy_customization)
 from .defs import DefsError, DefsSource, parse_xml
 
 NY_FILES = {
@@ -483,6 +485,12 @@ class VehicleType:
     groups: Dict[str, List[Component]] = field(default_factory=dict)
     turrets: List[TurretGroup] = field(default_factory=list)
     not_in_shop: bool = False
+    #: ``<camouflage><priceFactor>`` of the vehicle's own file.  The client's
+    #: item data copies it per vehicle type
+    #: (``vehicles.VehicleType.__init__`` -> ``vehicleCamouflagePriceFactors``),
+    #: and every vehicle of this build has it (``1.0`` for a tank whose paint
+    #: pattern needs no correction).
+    camouflage_price_factor: float = 1.0
     #: One entry per crew slot of the hull, each listing the roles the slot
     #: covers (``<crew><commander>gunner</commander><loader/></crew>`` ->
     #: ``(('commander', 'gunner'), ('loader',))``).  This is exactly the client's
@@ -647,6 +655,7 @@ class VehicleType:
             "userString": self.user_string,
             "shortUserString": self.short_user_string,
             "notInShop": self.not_in_shop,
+            "camouflagePriceFactor": self.camouflage_price_factor,
             "groups": {
                 group_name: [component.as_json() for component in components]
                 for group_name, components in self.groups.items()
@@ -689,6 +698,7 @@ class VehicleType:
             groups=groups,
             turrets=turrets,
             not_in_shop=bool(payload.get("notInShop", False)),
+            camouflage_price_factor=float(payload.get("camouflagePriceFactor", 1.0)),
             crew_roles=tuple(tuple(slot) for slot in payload.get("crewRoles", ())),
         )
 
@@ -864,7 +874,8 @@ class VehicleCatalog:
 class Catalog:
     def __init__(self, new_year: NyCatalog, vehicles: VehicleCatalog,
                  customization: "CustomizationCatalog" = None, meta: dict = None,
-                 badges: Dict[int, badges_module.Badge] = None):
+                 badges: Dict[int, badges_module.Badge] = None,
+                 legacy_customization: "LegacyCustomization" = None):
         self.new_year = new_year
         self.vehicles = vehicles
         # The appearance items of the installation (paints, camouflages, decals,
@@ -878,6 +889,12 @@ class Catalog:
         # reads the same file, so this is only what the profile commands
         # validate a badge id against.
         self.badges: Dict[int, badges_module.Badge] = dict(badges or {})
+        # The legacy appearance tables of the shop cache (camouflage and
+        # emblem price factors plus their hidden lists), read from the same
+        # files the client's own item data reads.
+        if legacy_customization is None:
+            legacy_customization = LegacyCustomization()
+        self.legacy_customization = legacy_customization
         self.meta = meta or {}
 
     @property
@@ -893,6 +910,25 @@ class Catalog:
         """``{id: name}`` of the installation's badges."""
         return badges_module.badge_ids(self.badges)
 
+    def vehicle_camouflage_price_factors(self) -> Dict[int, float]:
+        """``vehicleCamouflagePriceFactors``: ``{typeCompDescr: factor}``."""
+        return {vehicle.compact_descr: float(vehicle.camouflage_price_factor)
+                for vehicle in self.vehicles.all()}
+
+    def not_in_shop_items(self) -> set:
+        """``notInShopItems``: everything the installation keeps out of the shop.
+
+        The appearance half of the shop cache carries the items of the second
+        customization system (``CustomizationCatalog.not_in_shop``); the vehicles
+        themselves add their ``<notInShop>`` flag from ``list.xml``
+        (``_readVehicleType``), and the legacy camouflages, inscriptions and
+        emblems are *not* part of this set - they have hidden lists of their own.
+        """
+        items = set(self.customization.not_in_shop())
+        items.update(vehicle.compact_descr for vehicle in self.vehicles.all()
+                     if vehicle.not_in_shop)
+        return items
+
     def to_json(self) -> dict:
         vehicles = self.vehicles.to_json()
         payload = {
@@ -905,6 +941,7 @@ class Catalog:
             "shells": vehicles["shells"],
             "devices": vehicles["devices"],
             "customization": self.customization.to_json(),
+            "legacyCustomization": self.legacy_customization.to_json(),
         }
         return payload
 
@@ -926,7 +963,8 @@ class Catalog:
         # An export of schema 1 has no appearance items; the catalogue then
         # simply knows none (the shop publishes no customization prices).
         customization = CustomizationCatalog.from_json(payload.get("customization") or {})
-        return cls(new_year, vehicles, customization, payload)
+        legacy = LegacyCustomization.from_json(payload.get("legacyCustomization") or {})
+        return cls(new_year, vehicles, customization, payload, legacy_customization=legacy)
 
     @classmethod
     def load(cls, source: DefsSource) -> "Catalog":
@@ -939,7 +977,8 @@ class Catalog:
         new_year = load_ny_catalog(source)
         vehicles = load_vehicle_catalog(source)
         return cls(new_year, vehicles, CustomizationCatalog.load(source),
-                   badges=badges_module.load_badges(source))
+                   badges=badges_module.load_badges(source),
+                   legacy_customization=load_legacy_customization(source, nyc.NATIONS))
 
 
 # --------------------------------------------------------------------------
@@ -1278,6 +1317,12 @@ def _read_crew_roles(section) -> Tuple[Tuple[str, ...], ...]:
 
 def _apply_vehicle_xml(vehicle: VehicleType, section, components: Dict[str, Dict[str, Component]]) -> None:
     vehicle.crew_roles = _read_crew_roles(section)
+    # ``vehicles.VehicleType.__init__``: the camouflage factor of the vehicle
+    # itself, which the legacy camouflage prices are multiplied with.
+    camouflage = section.subsection("camouflage")
+    if camouflage is not None:
+        vehicle.camouflage_price_factor = camouflage.value_float(
+            "priceFactor", vehicle.camouflage_price_factor)
     groups: Dict[str, List[Component]] = {}
     for group_name in ("chassis", "engines", "fuelTanks", "radios"):
         group_section = section.subsection(group_name)

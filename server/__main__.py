@@ -54,6 +54,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="TCP port (default: %(default)s)")
     parser.add_argument("--save", default=DEFAULT_SAVE, help="account file (default: %(default)s)")
     parser.add_argument("--fresh", action="store_true", help="ignore the saved account and start over")
+    parser.add_argument("--no-announce", dest="announce", action="store_false",
+                        help="do not announce the event in the client's service channel "
+                             "(the New Year hangar notification is still sent)")
     parser.add_argument("--data", default=DEFAULT_CATALOG_CACHE,
                         help="account file (default: %(default)s)")
     parser.add_argument("--free-xp", type=int, default=None, help="override the starting free XP")
@@ -150,6 +153,7 @@ def _build_account(args, catalog, source: str) -> AccountState:
 
     state = AccountState.new(catalog, tankmen_configs=tankmen_configs,
                              garage_mode=getattr(args, "garage", "researchable"), **overrides)
+    state.events.service_messages = bool(getattr(args, "announce", True))
     nation_ids = None
     if args.only_nation:
         nation_ids = [nyc.NATION_INDICES[name] for name in args.only_nation if name in nyc.NATION_INDICES]

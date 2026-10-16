@@ -33,6 +33,7 @@ from . import loader
 from .account_rpc import commands as cmd
 from .account_rpc.server import PROTOCOL_VERSION, AccountServer
 from .account_rpc.state import AccountState
+from .game import dossier as dossier_module
 from .game.defs import DefsError
 from .proto import pack_message, py2_loads, read_frame, unpack_message
 
@@ -433,11 +434,22 @@ def check_session(catalog, tankmen_configs=None, stream=None) -> Report:
 
         response, _, _, _ = client.command(8, cmd.CMD_REQ_ACCOUNT_DOSSIER, (1, 0, 0))
         ext = py2_loads(response.get("ext")) if response.get("ext") else {}
-        if response.get("code") == cmd.RES_SUCCESS and ext.get("dossier") == b"":
-            report.ok("the account dossier is answered",
-                      "empty (the client builds a fresh dossier from it)")
-        else:
+        dossier = ext.get("dossier")
+        if response.get("code") != cmd.RES_SUCCESS or not dossier:
             report.fail("the account dossier is not answered", repr(response))
+        else:
+            try:
+                version, blocks = dossier_module.parse(dossier)
+            except dossier_module.DossierError as error:
+                report.fail("the account dossier cannot be read", str(error))
+            else:
+                # The client's ``DossierBuilder.build`` unpacks the dossier's own
+                # *version* out of the descriptor, so the answer has to be a whole
+                # dossier of the version the profile screens expect (an empty one
+                # made the client build a descriptor of its own).
+                report.ok("the account dossier is answered",
+                          "version %s, %d block(s), %d bytes"
+                          % (version, len(blocks), len(dossier)))
 
         badges = sorted(getattr(catalog, "badges", None) or ())
         if not badges:

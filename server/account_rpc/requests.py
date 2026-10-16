@@ -147,6 +147,8 @@ class RequestDispatcher:
             cmd.CMD_BUY_TMAN: self.on_buy_tman,
             cmd.CMD_SELL_VEHICLE: self.on_sell_vehicle,
             cmd.CMD_SELL_ITEM: self.on_sell_item,
+            cmd.CMD_VEHICLE_TRADE_IN: self.on_trade_in_vehicle,
+            cmd.CMD_QUERY_BALANCE_INFO: self.on_query_balance_info,
             cmd.CMD_BUY_SLOT: self.on_buy_slot,
             cmd.CMD_BUY_BERTHS: self.on_buy_berths,
             cmd.CMD_BUY_AND_EQUIP_ITEM: self.on_buy_and_equip_item,
@@ -279,6 +281,33 @@ class RequestDispatcher:
         """``CMD_BUY_VEHICLE`` - ``[rev, compDescr, flags, tmanCost, rent]``."""
         _revision, compact, flags, tman_cost, _rent = purchases_module.parse_buy_vehicle(args)
         return self._purchase(self.shop.buy_vehicle, compact, flags, tman_cost)
+
+    def on_trade_in_vehicle(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_VEHICLE_TRADE_IN`` - ``IntArr [rev, vehInvID, vehCD, flags, tmanCost]``.
+
+        The traded-off vehicle is the *old* one (``vehInvID``) and the compact
+        descriptor is the new vehicle, exactly as ``Shop.tradeInVehicle`` sends
+        it; the answer's ``ext['vehInvID']`` is the inventory id of the new one.
+        """
+        values = _flat_args(args)
+        if len(values) < 3:
+            return Response(code=cmd.RES_WRONG_ARGS,
+                            error=purchases_module.TRADE_IN_ERROR)
+        return self._purchase(self.shop.trade_in, values[1], values[2],
+                              values[3] if len(values) > 3 else 0,
+                              values[4] if len(values) > 4 else 0)
+
+    def on_query_balance_info(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_QUERY_BALANCE_INFO`` (10017) - ``doCmdStr('')``.
+
+        The whole answer is ``ext``: the client's ``Account.requestWGMBalanceInfo``
+        hands it to ``WGMBalanceInfoRequester`` unchanged and that requester walks
+        the rows (see :meth:`server.account_rpc.economics.Wallet.balance_info`).
+        """
+        rows = self.wallet.balance_info()
+        self.log.info("balance info: %d rows (%d credits, %d gold)",
+                      len(rows), self.state.credits, self.state.gold)
+        return Response(ext=rows)
 
     def on_buy_item(self, request_id: int, args: Sequence) -> Response:
         """``CMD_BUY_ITEM`` - ``(rev, itemShopID, count, goldForCredits)``."""
@@ -629,6 +658,12 @@ class RequestDispatcher:
             result, events_data=events_data or bool(result.chest_loot)
         )
         diff.update(self.state.granted_account_diff(granted))
+        if granted.get("announced"):
+            # The answer itself tells the client of the new message: the
+            # notification list rides in the plain ``eventsData`` key, which the
+            # client diffs against the one it cached and forwards only the new
+            # entries of (``Account.__synchronizeEventNotifications``).
+            diff.update(self.state.events.notifications_diff())
         response = Response(ext={"newYear": dict(diff.get("newYear", {}))}, diffs=[diff])
         if result.bonuses is not None:
             response.actions.append(

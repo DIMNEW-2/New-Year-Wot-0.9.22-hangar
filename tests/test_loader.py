@@ -53,17 +53,20 @@ SAMPLE_FILES = (
 
 
 def _sample_source(runner) -> str:
-    """A real ``item_defs`` folder of the installation the tests run against."""
+    """A real ``item_defs`` folder of the installation the tests run against.
+
+    The path the tests are given may be the folder itself, the game folder or
+    anything in between (a decompiled ``res`` keeps its definitions under
+    ``scripts/item_defs``), so the same discovery the server uses
+    (:func:`server.loader.find_client`) picks the source.
+    """
     client = common.require_client(runner.client)
     if os.path.basename(os.path.normpath(client)) == "item_defs":
-        source = client
-    else:
-        source = os.path.join(client, "item_defs")
-        if not os.path.isdir(source):
-            source = client
-    if not os.path.isdir(source):
-        raise common.Skip("no item_defs tree at %s" % source)
-    return source
+        return client
+    try:
+        return loader.find_client(client).item_defs
+    except Exception as error:
+        raise common.Skip("no item_defs tree at %s (%s)" % (client, error))
 
 
 def _copy_tree(source: str, target: str, files=SAMPLE_FILES) -> int:

@@ -5,9 +5,10 @@ dispatcher (the same one the socket server calls) and the answers are checked
 for what the *client* would read:
 
 * ``stats['dossier']`` and the ``dossier`` of a 504/505 answer are compact
-  descriptors the client's ``dossiers2`` builds a dossier out of - an empty one
-  is a fresh dossier of the current version, which is what an account without a
-  single battle reports,
+  descriptors the client's ``dossiers2`` builds a dossier out of; the local
+  server writes the version and the two blocks it really knows (the date of the
+  account and the badges it earned) and leaves every statistic block zero sized
+  (see :mod:`server.game.dossier`),
 * ``CMD_SYNC_DOSSIERS`` is answered with the streamed ``(version, [...])``
   ``DossierCache`` unpacks (``SyncController`` -> ``zlib`` + ``cPickle``),
 * ``CMD_SELECT_BADGES`` publishes the selection the way ``ClientBadges`` reads
@@ -32,6 +33,7 @@ from server.account_rpc.requests import RequestDispatcher  # noqa: E402
 from server.account_rpc.state import AccountState  # noqa: E402
 from server.game import badges as badges_module  # noqa: E402
 from server.game import defs as defs_module  # noqa: E402
+from server.game import dossier as dossier_module  # noqa: E402
 from server.proto import unpack_stream  # noqa: E402
 
 SPA_PATH = "/common/goldfish_bonus_applied/"
@@ -55,23 +57,55 @@ def test_the_sync_carries_the_dossier_and_the_badges(runner):
     diff = state.full_diff()
     runner.check("stats" in diff and "dossier" in diff["stats"],
                  "the stats section carries the account dossier")
-    # The client turns an empty descriptor into a fresh dossier
-    # (``DossierBuilder.build('')``), which is the only honest answer for an
-    # account that never fought.
-    runner.equal(diff["stats"]["dossier"], b"", "an account without battles has an empty dossier")
+    # The client's ``DossierBuilder.build`` reads the version out of the header
+    # and then one size per block, so the descriptor has to be the client's own
+    # format - and its statistics have to be zero: this account never fought.
+    descr = diff["stats"]["dossier"]
+    version, blocks = dossier_module.parse(descr)
+    runner.equal(version, dossier_module.ACCOUNT_DOSSIER_VERSION,
+                 "the dossier carries the version of this build")
+    runner.equal(sorted(blocks), sorted([dossier_module.TOTAL_BLOCK,
+                                         dossier_module.BADGES_BLOCK]),
+                 "a fresh account has a date and its badges, nothing else")
+    total = dossier_module.read_total(descr)
+    runner.equal(total["creationTime"], int(state.created_at),
+                 "the dossier remembers when the account was made")
+    runner.equal(total["lastBattleTime"], 0,
+                 "an account without battles has no last battle")
+    runner.equal(total["battleLifeTime"], 0, "and no time in battle")
+    runner.check(state.achieved_badges, "the account earned the installation's badges")
+    runner.equal(dossier_module.read_badges(descr), dict(state.achieved_badges),
+                 "every earned badge is in the dossier")
     runner.equal(diff["badges"], [], "no badge is selected yet")
     runner.equal(diff["cache"]["SPA"], {}, "no dossier field was written yet")
+
+
+def test_the_cache_carries_the_wallet_flag_and_the_vehicle_locks(runner):
+    """``Stats.synchronize``/``Inventory.synchronize`` read these out of ``cache``."""
+    dispatcher, state = _dispatcher(runner)
+    cache = state.full_diff()["cache"]
+    runner.equal(cache["mayConsumeWalletResources"], True,
+                 "the wallet may consume resources (``StatsRequester``)")
+    runner.equal(cache["vehsLock"], {},
+                 "no vehicle is locked: the local server has no battles")
+    runner.check("SPA" in cache, "the dossier paths travel in the cache section")
 
 
 def test_the_client_can_ask_for_both_dossiers(runner):
     dispatcher, state = _dispatcher(runner)
     response = dispatcher.handle(1, cmd.CMD_REQ_ACCOUNT_DOSSIER, (1, 0, 0))
     runner.equal(response.code, cmd.RES_SUCCESS, "the account dossier is answered")
-    runner.equal(response.ext["dossier"], b"", "the account dossier is empty")
+    version, blocks = dossier_module.parse(response.ext["dossier"])
+    runner.equal(version, dossier_module.ACCOUNT_DOSSIER_VERSION,
+                 "the account dossier is the one of this build")
+    runner.check(blocks.get(dossier_module.TOTAL_BLOCK),
+                 "the account dossier carries its date")
 
     response = dispatcher.handle(2, cmd.CMD_REQ_VEHICLE_DOSSIER, (1, 12345, 0))
     runner.equal(response.code, cmd.RES_SUCCESS, "the vehicle dossier is answered")
-    runner.equal(response.ext["dossier"], b"", "the vehicle dossier is empty")
+    version = dossier_module.parse(response.ext["dossier"])[0]
+    runner.equal(version, dossier_module.VEHICLE_DOSSIER_VERSION,
+                 "the vehicle dossier is the one of this build")
 
 
 def test_the_player_info_describes_this_account(runner):
@@ -83,7 +117,9 @@ def test_the_player_info_describes_this_account(runner):
                 "eSportSeasons", "ranked"):
         runner.check(key in response.ext, "the player info carries %r" % (key,))
     runner.equal(response.ext["databaseID"], state.database_id, "the account id travels back")
-    runner.equal(response.ext["dossier"], b"", "the dossier of the account is empty")
+    runner.equal(dossier_module.parse(response.ext["dossier"])[0],
+                 dossier_module.ACCOUNT_DOSSIER_VERSION,
+                 "the dossier of the account is the fresh one of this build")
     runner.equal(response.ext["clanDBID"], 0, "the account is in no clan")
 
     response = dispatcher.handle(2, cmd.CMD_REQ_PLAYER_CLAN_INFO, (state.database_id, 0, 0))

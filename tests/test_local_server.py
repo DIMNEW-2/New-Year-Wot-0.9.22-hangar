@@ -264,10 +264,12 @@ def test_account_survives_a_restart(runner: common.Runner) -> None:
 def test_hangar_notifications_ride_only_in_the_full_sync(runner: common.Runner) -> None:
     """The New Year hangar scene arrives once; updates never repeat it.
 
-    ``Account.__synchronizeEventNotifications`` reports *every* notification it
-    receives as freshly added, and ``ClientHangarSpace`` recreates the hangar for
-    each ``cmd_change_hangar`` entry, so a chest opened later must not carry the
-    notification list again.
+    A notification list under ``('eventsData', '_r')`` is what
+    ``Account.__synchronizeEventNotifications`` reads as "all of these are new"
+    - and ``ClientHangarSpace`` recreates the hangar for every
+    ``cmd_change_hangar`` entry - so the replacement section of an update never
+    carries the list; the plain ``eventsData`` key (which the client *diffs*
+    against its cache) is for the one new message of a level-up.
     """
     from server.game.events import CMD_CHANGE_HANGAR, EVENT_CLIENT_DATA, NEW_YEAR_HANGAR_PATH
 
@@ -301,6 +303,12 @@ def test_hangar_notifications_ride_only_in_the_full_sync(runner: common.Runner) 
             runner.check(EVENT_CLIENT_DATA["NOTIFICATIONS"] not in sections
                          and EVENT_CLIENT_DATA["NOTIFICATIONS_REV"] not in sections,
                          "the update does not repeat the notifications")
+            # A new message (a New Year level-up) instead rides in the *plain*
+            # ``eventsData`` key of an update - the client diffs that list against
+            # the one it cached and forwards only the new entries
+            # (``EventDataBuilder.notifications_diff``).
+            runner.check("eventsData" not in diff,
+                         "and needs no plain section either (nothing was announced)")
             runner.check(EVENT_CLIENT_DATA["QUEST"] in sections,
                          "the update still carries the quests")
         for diff_part in diffs:

@@ -8,31 +8,29 @@ the player's statistics from two places:
 * the **dossier cache** of one descriptor per vehicle, which the client
   synchronizes on its own with ``CMD_SYNC_DOSSIERS``.
 
-Both are empty here, and the client is written for exactly that: an empty
-descriptor is a *new* dossier (``DossierBuilder.build('')`` packs the current
-version with every block zero sized and ``_initializeNewDossier`` stamps the
-creation time), so the local server never has to mirror the block layout of the
-client's ``dossiers2/custom/records.py``.  An account that never fought has
-nothing to report, and reporting zeros is what the live server does for one, too
-- it just has a real descriptor to say it with.
+The account dossier of this server carries the date of the account and the
+badges it earned, and every statistics block of it stays empty - an account that
+never fought has nothing else to report (:mod:`server.game.dossier`).  A vehicle
+dossier is empty outright, which the client reads as a fresh dossier
+(``dossiers2.getVehicleDossierDescr('')`` / ``DossierBuilder.build('')``).
 
 The rest of the profile *is* state:
 
 * ``CMD_SELECT_BADGES`` stores the badges the player picked and publishes them
   as ``diff['badges']`` - the client's ``ClientBadges`` puts that straight into
-  ``cache['badges']`` and ``BadgesRequester.selected`` reads it back.  The badge
-  ids are validated against the installation's own ``item_defs/badges.xml``;
-  whether a badge was *earned* is a question for the dossier's achievements, and
-  the client checks that itself before it sends the request
-  (``processors.plugins.BadgesValidator``),
+  ``cache['badges']`` and ``BadgesRequester.selected`` reads it back.  The ids
+  are validated against the installation's own ``item_defs/badges.xml`` and
+  against the badges the dossier says were earned - the same two rules the
+  client applies itself before it sends the request
+  (``processors.plugins.BadgesValidator`` reads ``Badge.isAchieved``, which is
+  the ``playerBadges`` block of the account dossier),
 * ``CMD_SET_DOSSIER_FIELD`` writes one value under a dossier path.  The live
-  server rewrites the dossier's ``common`` block; a local server that does not
-  know the layout keeps the value in the ``SPA`` cache instead, which is where
-  the client looks such paths up (``StatsRequester.SPA``,
-  ``isGoldFishBonusApplied``),
+  server rewrites a block of the dossier; the local one keeps the value in the
+  ``SPA`` cache instead, which is where the client looks such paths up
+  (``StatsRequester.SPA``, ``isGoldFishBonusApplied``),
 * ``CMD_REQ_PLAYER_INFO``, ``CMD_REQ_PLAYER_CLAN_INFO`` and the two global
-  rating requests answer for the one account this server has: its (empty)
-  dossier, no clan and a rating of zero.
+  rating requests answer for the one account this server has: its dossier, no
+  clan and a rating of zero.
 """
 
 from __future__ import annotations
@@ -40,6 +38,7 @@ from __future__ import annotations
 import logging
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+from ..game import dossier as dossier_module
 from . import commands as cmd
 
 LOG = logging.getLogger("wotny.profile")
@@ -50,6 +49,9 @@ LOG = logging.getLogger("wotny.profile")
 #: with the closest key it has.
 ERROR_WRONG_ARGS = "wrong_args"
 ERROR_SERVER = "server_error"
+#: ``processors.plugins.BadgesValidator`` refuses a badge that was not earned
+#: with the same name (``NOT_UNLOCKED_BADGE``).
+ERROR_NOT_UNLOCKED = "not_unlocked_badge"
 
 
 class ProfileError(Exception):
@@ -77,11 +79,18 @@ class Profile(object):
     def dossier(self, vehicle_type_cd: int = None) -> bytes:
         """The compact descriptor of a dossier.
 
-        Always empty: the client turns that into a fresh dossier of the current
-        version, both for the account (``ItemsRequester.__getAccountDossierDescr``)
-        and for a vehicle (``dossiers2.getVehicleDossierDescr``).
+        The account dossier is the one the server keeps: it carries the date of
+        the account and the badges it earned (``server.game.dossier``, published
+        as ``stats['dossier']`` and here for the profile of *other* players).
+        A vehicle dossier carries no statistic at all - no battle was ever
+        fought in one - but it still travels as a descriptor of the *vehicle*
+        version with every block zero sized, so the client's ``DossierBuilder``
+        reads the version it knows instead of falling back to its own empty
+        descriptor (``build('')``).
         """
-        return b""
+        if vehicle_type_cd:
+            return dossier_module.empty(dossier_module.VEHICLE)
+        return self.state.account_dossier()
 
     def dossier_ext(self, vehicle_type_cd: int = None) -> dict:
         """``CMD_REQ_ACCOUNT_DOSSIER``/``CMD_REQ_VEHICLE_DOSSIER`` answer."""
@@ -92,8 +101,9 @@ class Profile(object):
 
         The client's ``DossierCache`` keeps the version it sent when the answer
         echoes it, and an empty list means "nothing changed and there is nothing
-        cached", so every vehicle dossier the client asks for afterwards is built
-        from an empty descriptor.
+        cached": every vehicle dossier the client asks for afterwards is answered
+        by :meth:`dossier` with an empty one.  There is nothing else to sync -
+        the local server has no battles, so no dossier ever changes.
         """
         return int(version), []
 
@@ -115,6 +125,11 @@ class Profile(object):
     def clan_info_ext(self) -> dict:
         """``CMD_REQ_PLAYER_CLAN_INFO`` answer: the account is in no clan."""
         return {"clanDBID": 0, "clanInfo": None}
+
+    @property
+    def achieved_badges(self) -> Dict[int, int]:
+        """``{badgeID: time earned}`` - ``playerBadges`` of the dossier."""
+        return dict(getattr(self.state, "achieved_badges", None) or {})
 
     @property
     def database_id(self) -> int:
@@ -143,7 +158,14 @@ class Profile(object):
         return int(badge_id) in self.badges
 
     def select_badges(self, badge_list: Iterable[int]) -> dict:
-        """``CMD_SELECT_BADGES`` - store the selection and answer with its diff."""
+        """``CMD_SELECT_BADGES`` - store the selection and answer with its diff.
+
+        The client only offers badges it believes are earned
+        (``processors.plugins.BadgesValidator`` reads ``Badge.isAchieved``, which
+        is the ``playerBadges`` block of the account dossier), and the local
+        server holds the same two rules: an id the installation does not know is
+        ``wrong_args``, one that was not earned is ``not_unlocked_badge``.
+        """
         selected: List[int] = []
         for raw in badge_list or ():
             badge_id = int(raw)
@@ -151,6 +173,9 @@ class Profile(object):
                 continue
             if badge_id not in self.badges:
                 raise ProfileError("badge %d is not a badge of the installation" % badge_id)
+            if badge_id not in self.achieved_badges:
+                raise ProfileError("badge %d was not earned" % badge_id,
+                                   error=ERROR_NOT_UNLOCKED)
             selected.append(badge_id)
         self.state.badges = selected
         LOG.info("the profile now shows the badges %s", selected)
@@ -168,6 +193,7 @@ class Profile(object):
 
 
 __all__ = [
+    "ERROR_NOT_UNLOCKED",
     "ERROR_SERVER",
     "ERROR_WRONG_ARGS",
     "Profile",

@@ -12,6 +12,9 @@ Their argument order is the client's (``client/account_helpers/Stats.py``):
 ``CMD_PREMIUM`` (204)       ``Int3 (shopRev, days, arenaUniqueID)`` - ``days``
                             of premium account for ``premiumCost[days]`` gold
 ``CMD_UNLOCK_ALL`` (10004)  ``Int3 (0, 0, 0)`` - the debug "research everything"
+``CMD_QUERY_BALANCE_INFO``
+(10017)                     ``Str ('')`` - the wallet's own breakdown, answered
+                            with ``ext`` alone (see :meth:`Wallet.balance_info`)
 ==========================  ===================================================
 
 The prices and rates are the ones the client's own dialogs show: the gold of an
@@ -49,6 +52,11 @@ ERROR_NOT_ENOUGH_MONEY = "not_enough_money"
 #: How much experience may be converted for free per request when the client
 #: asks for a free conversion (``shop.freeXPConversionLimit``).
 DEFAULT_FREE_XP_LIMIT = 100000
+
+#: The ``currency_code`` values ``WGMBalanceInfoRequester`` understands
+#: (``gui/shared/money.py``); any other row is logged and dropped by the client.
+CURRENCY_GOLD = "gold"
+CURRENCY_CREDITS = "credits"
 
 
 class Wallet(object):
@@ -174,6 +182,35 @@ class Wallet(object):
                  veh_type_compact, int(unlock_index))
         return self._result()
 
+    # -- wallet breakdown (``CMD_QUERY_BALANCE_INFO``) -------------------
+    def balance_info(self) -> List[dict]:
+        """``CMD_QUERY_BALANCE_INFO`` - the rows of the WGM balance tooltip.
+
+        ``Account.requestWGMBalanceInfo`` sends ``doCmdStr(..., '')`` and hands
+        the ``ext`` of the answer to ``WGMBalanceInfoRequester``, which reads
+        ``currency_code``, ``amount`` and ``class['is_paid']`` of every row and
+        keys the result by ``<currency>_purchased`` / ``<currency>_earned``
+        (``gui/shared/utils/requesters/wgm_balance_info_requester.py``).  The
+        tooltip itself (``gui/shared/tooltips/wgm_currency.py``) then shows both
+        rows per currency; the total it takes from the account, so the rows have
+        to add up to the wallet the client already displays.
+
+        Nothing is ever *purchased* on a local server - there is no billing
+        behind it - so the whole balance travels as the ``earned`` row and the
+        ``purchased`` row is zero.  Both rows are sent for both currencies: a
+        missing row would show up as ``-`` in the tooltip instead of a number.
+        """
+        rows: List[dict] = []
+        for currency, amount in ((CURRENCY_GOLD, self.state.gold),
+                                 (CURRENCY_CREDITS, self.state.credits)):
+            rows.append({"currency_code": currency,
+                         "class": {"is_paid": True},
+                         "amount": 0})
+            rows.append({"currency_code": currency,
+                         "class": {"is_paid": False},
+                         "amount": max(0, int(amount))})
+        return rows
+
     def unlock_all(self) -> dict:
         """``CMD_UNLOCK_ALL`` - grant every vehicle of the catalogue (debug command)."""
         granted = self.state.grant_garage(mode=state_module.GARAGE_RESEARCHABLE)
@@ -181,4 +218,5 @@ class Wallet(object):
         return self._result()
 
 
-__all__ = ["ERROR_NOT_ENOUGH_MONEY", "ERROR_SERVER", "Wallet"]
+__all__ = ["CURRENCY_CREDITS", "CURRENCY_GOLD", "ERROR_NOT_ENOUGH_MONEY",
+           "ERROR_SERVER", "Wallet"]

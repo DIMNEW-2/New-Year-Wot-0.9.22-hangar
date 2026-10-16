@@ -22,16 +22,27 @@ cache the client displays, so the number in the dialog and the number the local
 server charges never disagree: a buy costs ``itemPrices[compact]`` and a sale
 refunds ``ceil(sellPriceFactor * (credits + gold * exchangeRate))``
 (``Shop.getSellPrice``, with the shells/equipment rate for those two types).
+
+A vehicle the New Year event offers a discount on costs less than that: the
+client's ``Vehicle.buyPrices`` shows the price of the personal offer whenever it
+is cheaper, and the buy dialog charges what it shows (``VehicleBuyer._getPrice``
+= ``buyPrices.itemPrice.price`` plus crew and ammunition), so
+:meth:`Shopkeeper.goodie_price` applies the offer to the base price of the
+vehicle and the purchase then uses the offer up (see
+:mod:`server.game.goodies` and :meth:`AccountState.consume_goodie`).
 """
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Dict, Optional, Sequence, Tuple
 
 from ..game import items as items_module
 from ..game import shop as shop_module
 from .state import AccountState
+
+LOG = logging.getLogger("wotny.purchases")
 
 ItemType = int
 Price = Tuple[int, int]
@@ -52,6 +63,22 @@ TANKMAN_TYPE = items_module.ITEM_TYPES["tankman"]
 #: ``items.tankmen.SKILL_NAMES`` orders.
 ROLE_BY_INDEX = {index: name for name, index in
                  zip(("commander", "radioman", "driver", "gunner", "loader"), range(1, 6))}
+
+#: The error key a malformed trade-in answers with; the client turns it into
+#: ``#system_messages:vehicle_trade_in/<key>`` (``VehicleTradeInProcessor``).
+TRADE_IN_ERROR = "invalid_vehicle"
+
+#: The modules ``VehicleEntry.components`` keeps, as ``(key, item type name)``.
+#: A trade-in returns the ones that are not the stock configuration.
+MODULE_ITEM_TYPES = (
+    ("chassis", "vehicleChassis"),
+    ("engine", "vehicleEngine"),
+    ("fuelTank", "vehicleFuelTank"),
+    ("radio", "vehicleRadio"),
+)
+
+#: ``nations.NONE_INDEX`` - the nation optional devices live in.
+NO_NATION = 15
 
 #: The cost of one garage slot and of one barracks berth pack (gold).
 SLOT_PRICE = 300
@@ -135,6 +162,40 @@ class Shopkeeper(object):
         credits = int(math.ceil(factor * (price[0] + price[1] * rate)))
         return credits * max(0, int(count))
 
+    # -- personal offers ------------------------------------------------
+    def goodie_price(self, vehicle) -> Tuple[Price, Optional[int]]:
+        """``((credits, gold), goodieID)`` of a vehicle with its personal offer.
+
+        ``ShopRequester.getPersonalVehicleDiscountPrice`` discounts the *shop*
+        price of the vehicle with the goodie's own currency
+        (``__getPriceWithDiscount``) and ``Vehicle.buyPrices`` then takes that
+        price whenever it is cheaper than the shop's own - which it always is,
+        because the offer can only lower a price.  The discounted value is what
+        the buy dialog shows and therefore what the server has to charge, so the
+        two numbers stay one and the same.  ``None`` as the second value means
+        the vehicle has no offer (or the account does not own one).
+        """
+        credits = int(vehicle.price_credits)
+        gold = int(vehicle.price_gold)
+        goodie = self.state.goodie_for_vehicle(vehicle.compact_descr)
+        if goodie is None:
+            return (credits, gold), None
+        return goodie.discounted_price(credits, gold), int(goodie.uid)
+
+    def _consume_goodie(self, goodie_id: Optional[int]) -> dict:
+        """The diff section that takes a used-up offer off the account.
+
+        The client's ``ClientGoodies`` merges the goodies it is told about with
+        ``synchronizeDicts``, and that helper re-adds a key it just saw a ``None``
+        for, so a goodie that has to *go away* can only travel in the replacement
+        section - the same ``('goodies', '_r')`` section (holding the whole
+        ``{'goodies': {...}}`` cache of ``GoodiesRequester``) the event itself
+        uses when a certificate is claimed.
+        """
+        if goodie_id is None:
+            return {}
+        return {("goodies", "_r"): self.state.consume_goodie(goodie_id)}
+
     def _charge(self, credits: int = 0, gold: int = 0) -> None:
         """Take the price: every currency the price names has to be there.
 
@@ -180,7 +241,7 @@ class Shopkeeper(object):
             raise PurchaseError(-1, "ALREADY_BOUGHT")
         crew = bool(flags & BUY_VEHICLE_FLAG_CREW)
         shells = bool(flags & BUY_VEHICLE_FLAG_SHELLS)
-        credits, gold = int(vehicle.price_credits), int(vehicle.price_gold)
+        (credits, gold), goodie_id = self.goodie_price(vehicle)
         if crew:
             members = len(state.crew_roles_of_type(vehicle))
             crew_credits, crew_gold = self.crew_cost(tman_cost_type_index)
@@ -192,11 +253,17 @@ class Shopkeeper(object):
             gold += ammo_gold
         self._charge(credits=credits, gold=gold)
         entry = state.add_vehicle(vehicle, crew=crew, shells=shells)
+        if goodie_id is not None:
+            LOG.info("vehicle %s bought with the discount offer %s",
+                     vehicle.compact_descr, goodie_id)
         return {
             "code": 0,
             "ext": {"vehInvID": entry.inv_id},
-            "diff": self.purchase_diff(vehicle_inv_ids=[entry.inv_id],
-                                       tankman_inv_ids=[t for t in entry.crew if t]),
+            "diff": self.purchase_diff(
+                vehicle_inv_ids=[entry.inv_id],
+                tankman_inv_ids=[t for t in entry.crew if t],
+                extra=self._consume_goodie(goodie_id),
+            ),
         }
 
     def _default_ammo(self, vehicle) -> list:
@@ -346,6 +413,148 @@ class Shopkeeper(object):
                                        item_types=list(state.items.keys())),
         }
 
+    # -- trade-in -------------------------------------------------------
+    def trade_off_price(self, vehicle) -> int:
+        """The gold discount trading ``vehicle`` off is worth.
+
+        ``Vehicle.tradeOffPrice`` of the client - ``ceil(sellPriceFactor *
+        buyPrices.itemPrice.price.gold)`` - so the discount the shop dialogue
+        shows and the discount the local server deducts are the same number.
+        """
+        config = self.shop.payload().get("tradeIn") or {}
+        factor = float(config.get("sellPriceFactor", 0.0) or 0.0)
+        # ``Vehicle.buyPrices`` carries a personal offer when the account owns
+        # one, so the trade-off value is computed from the same gold price the
+        # buy dialogue shows for the vehicle being traded off.
+        _credits, gold = self.goodie_price(vehicle)[0]
+        return int(math.ceil(factor * max(0, int(gold))))
+
+    def trade_in(self, old_inv_id: int, compact_descr: int, flags: int = 0,
+                 tman_cost_type_index: int = 0) -> dict:
+        """``CMD_VEHICLE_TRADE_IN``: swap an old premium tank for a new one.
+
+        The client's ``VehicleTradeInProcessor`` charges ``buyPrice -
+        oldVehicle.tradeOffPrice``, asks for one free berth per crew member of
+        the traded-off vehicle (its crew moves into the barracks) and sends the
+        same flags a plain purchase does for the shells and the new crew.  The
+        vehicle that is traded off carries no item lists - a trade-in is not a
+        sale - so everything the player paid for on it goes back into the depot.
+        """
+        state = self.state
+        old_entry = state.vehicles.get(int(old_inv_id))
+        if old_entry is None:
+            raise PurchaseError(-1, "vehicle_not_found_in_inventory")
+        old_vehicle = state.catalog.vehicles.get(old_entry.compact_descr)
+        if old_vehicle is None:
+            raise PurchaseError(-1, "invalid_vehicle")
+        new_vehicle = self.vehicle_type(compact_descr)
+        config = self.shop.payload().get("tradeIn") or {}
+        if not float(config.get("sellPriceFactor", 0.0) or 0.0):
+            raise PurchaseError(-1, "vehicle_cannot_trade_in")
+        levels = [int(level) for level in (config.get("allowedVehicleLevels") or ())]
+        if int(compact_descr) in set(config.get("forbiddenVehicles") or ()):
+            raise PurchaseError(-1, "vehicle_cannot_trade_off")
+        if not old_vehicle.is_premium or (levels and old_vehicle.level not in levels):
+            raise PurchaseError(-1, "vehicle_cannot_trade_off")
+        if not new_vehicle.is_premium or (levels and new_vehicle.level not in levels):
+            raise PurchaseError(-1, "vehicle_cannot_trade_in")
+        if int(compact_descr) in state.owned_vehicle_comp_descrs():
+            raise PurchaseError(-1, "vehicle_cannot_trade_in")
+        crew = [tankman_id for tankman_id in old_entry.crew if tankman_id not in (-1, None)]
+        if len(crew) > state.free_berths():
+            raise PurchaseError(-1, "not_enough_space")
+
+        crew_flag = bool(flags & BUY_VEHICLE_FLAG_CREW)
+        shells_flag = bool(flags & BUY_VEHICLE_FLAG_SHELLS)
+        # The personal offer and the traded-off vehicle both come off the price
+        # of the new one (``VehicleTradeInProcessor._getPrice`` is the buyer's
+        # price - which already carries the offer - minus the trade-off value).
+        (credits, gold), goodie_id = self.goodie_price(new_vehicle)
+        if crew_flag:
+            members = len(state.crew_roles_of_type(new_vehicle))
+            crew_credits, crew_gold = self.crew_cost(tman_cost_type_index)
+            credits += crew_credits * members
+            gold += crew_gold * members
+        if shells_flag:
+            ammo_credits, ammo_gold = self.ammo_cost(new_vehicle, self._default_ammo(new_vehicle))
+            credits += ammo_credits
+            gold += ammo_gold
+        gold = max(0, gold - self.trade_off_price(old_vehicle))
+        self._charge(credits=credits, gold=gold)
+
+        returned = self._return_vehicle_items(old_entry, old_vehicle)
+        for tankman_id in crew:
+            crew_entry = state.tankmen.get(tankman_id)
+            if crew_entry is not None:
+                crew_entry.vehicle_inv_id = -1
+        del state.vehicles[old_entry.inv_id]
+        new_entry = state.add_vehicle(new_vehicle, crew=crew_flag, shells=shells_flag)
+        if goodie_id is not None:
+            LOG.info("vehicle %s traded in with the discount offer %s",
+                     new_vehicle.compact_descr, goodie_id)
+        return {
+            "code": 0,
+            "ext": {"vehInvID": new_entry.inv_id},
+            "diff": self.purchase_diff(
+                vehicle_inv_ids=[old_entry.inv_id, new_entry.inv_id],
+                tankman_inv_ids=crew + [tankman_id for tankman_id in new_entry.crew
+                                        if tankman_id not in (-1, None)],
+                item_types=returned,
+                extra=self._consume_goodie(goodie_id),
+            ),
+        }
+
+    def _return_vehicle_items(self, entry, vehicle) -> list:
+        """Everything the traded-off vehicle carries goes back into the depot.
+
+        A sale carries the two item lists the client wants taken off
+        (``CMD_SELL_VEHICLE``); a trade-in carries none, so the local server
+        keeps what the player paid for: the modules that are not the vehicle's
+        stock configuration, its optional devices, its equipment and the loaded
+        shells.  The vehicle itself is *not* refunded - it is the discount.
+        """
+        item_types = []
+        stock = dict(vehicle.stock_configuration() or {})
+        for key, type_name in MODULE_ITEM_TYPES:
+            mounted = int((entry.components or {}).get(key, 0) or 0)
+            if mounted and mounted != int(stock.get(key, 0) or 0):
+                item_types.append(self._depot_item(
+                    type_name, vehicle.nation_id, mounted))
+        stock_pairs = list(stock.get("turrets") or ())
+        for index, pair in enumerate(list(entry.turrets or ())):
+            pair = tuple(pair)
+            stock_pair = tuple(stock_pairs[index]) if index < len(stock_pairs) else (0, 0)
+            for position, type_name in ((0, "vehicleTurret"), (1, "vehicleGun")):
+                mounted = int(pair[position]) if position < len(pair) else 0
+                if mounted and mounted != int(stock_pair[position]):
+                    item_types.append(self._depot_item(
+                        type_name, vehicle.nation_id, mounted))
+        for device_id in list(entry.devices or ()):
+            if device_id not in (None, 0, -1):
+                item_types.append(self._depot_item("optionalDevice", NO_NATION,
+                                                   int(device_id)))
+        for compact_descr in list(entry.equipment or ()):
+            if int(compact_descr or 0):
+                item_types.append(self._depot_item_by_type(EQUIPMENT_TYPE, int(compact_descr)))
+        shells = list(entry.shells or ())
+        for index in range(0, len(shells) - 1, 2):
+            compact_descr, count = int(shells[index]), int(shells[index + 1])
+            if compact_descr and count > 0:
+                item_types.append(self._depot_item_by_type(SHELL_TYPE, compact_descr, count))
+        return sorted(set(item_types))
+
+    def _depot_item(self, item_type_name: str, nation_id: int, item_id: int) -> int:
+        """Put one nation-local item into the depot; returns its item type."""
+        item_type = int(items_module.ITEM_TYPES[item_type_name])
+        self.state.add_item(item_type, items_module.make_int_compact_descr_by_id(
+            item_type_name, int(nation_id), int(item_id)), 1)
+        return item_type
+
+    def _depot_item_by_type(self, item_type: int, compact_descr: int, count: int = 1) -> int:
+        """Put an already built compact descriptor into the depot."""
+        self.state.add_item(int(item_type), int(compact_descr), int(count))
+        return int(item_type)
+
     def sell_item(self, item_type: int, compact_descr: int, count: int) -> dict:
         """``CMD_SELL_ITEM``: refund ``count`` items of one type."""
         state = self.state
@@ -366,18 +575,21 @@ class Shopkeeper(object):
 
     # -- diffs ----------------------------------------------------------
     def purchase_diff(self, vehicle_inv_ids=(), tankman_inv_ids=(), item_types=(),
-                      stats: bool = False) -> dict:
+                      stats: bool = False, extra: dict = None) -> dict:
         """The incremental diff a purchase or a sale has to publish."""
         inventory = self.state.partial_inventory_diff(
             vehicle_inv_ids=vehicle_inv_ids,
             tankman_inv_ids=tankman_inv_ids,
             item_types=item_types,
         )
-        extra: Dict[str, dict] = {
+        sections: Dict = {
             "inventory": inventory,
             "economics": self.state.economics_diff(),
             "stats": self.state.purchase_stats_diff(),
         }
+        if extra:
+            sections.update(extra)
+        extra = sections
         if stats or not any((vehicle_inv_ids, tankman_inv_ids, item_types)):
             extra["stats"] = self.state._stats_diff()
         return self.state.incremental_diff(extra=extra)
@@ -385,6 +597,9 @@ class Shopkeeper(object):
 
 __all__ = [
     "BUY_VEHICLE_FLAG_CREW",
+    "MODULE_ITEM_TYPES",
+    "TRADE_IN_ERROR",
+    "NO_NATION",
     "BUY_VEHICLE_FLAG_NONE",
     "BUY_VEHICLE_FLAG_SHELLS",
     "PurchaseError",

@@ -17,8 +17,16 @@ is built here:
 ``crystalExchangeRate``
                      credits per crystal
 ``items``            ``itemPrices`` (every vehicle, module, shell, equipment
-                     and optional device) plus the per-nation customization
-                     tables a requester indexes without guarding an empty one
+                     and optional device), the per-nation customization tables
+                     a requester indexes without guarding an empty one (the
+                     legacy camouflage/inscription/emblem price factors and
+                     their hidden lists, ``vehicleCamouflagePriceFactors``) and
+                     ``notInShopItems``
+``goodies``          the personal discounts of the event (see
+                     :mod:`server.game.goodies`)
+``achievementsReward``
+                     the bond reward of an achievement (disabled: the local
+                     server awards no bonds)
 ``defaults``         what ``ShopCommonStats`` falls back to for a missing key
 ===================  =====================================================
 
@@ -33,6 +41,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Tuple
 
 from .catalog import Catalog
+from .goodies import GoodieTable
 
 #: The revision of the shop cache; every price lookup asserts it, so it only
 #: changes when the prices do.
@@ -76,6 +85,20 @@ DROP_SKILLS_COST = (
     {"credits": 0, "gold": 200, "xpReuseFraction": 1.0},
 )
 
+#: ``<tradeIn>`` of the client's shop cache: swapping an old premium vehicle for a
+#: discount on a new one (``gui/game_control/trade_in.py``).  ``sellPriceFactor``
+#: is the number the client multiplies the *old* vehicle's gold buy price with
+#: (``Vehicle.tradeOffPrice``), ``allowedVehicleLevels`` are the levels both
+#: halves of the deal have to be and ``forbiddenVehicles`` is the list of type
+#: compacts that can never be traded off.  Premium tanks live on levels 2 to 10,
+#: so that is what the local server allows.
+TRADE_IN = {
+    "sellPriceFactor": 0.5,
+    "allowedVehicleLevels": [2, 3, 4, 5, 6, 7, 8, 9, 10],
+    "forbiddenVehicles": [],
+    "minAcceptableSellPrice": 0,
+}
+
 #: ``ShopRequester`` defaults for the premium account packages: days -> gold.
 PREMIUM_COST = {1: 250, 3: 650, 7: 1250, 30: 2500, 180: 10000, 360: 18000}
 
@@ -98,6 +121,13 @@ REF_SYSTEM = {
     "posByXPinTeam": 0,
 }
 
+#: ``ShopRequester.getAchievementReward`` reads this section and gives up when
+#: ``isEnabled`` is false - which is what the local server publishes: bond
+#: rewards belong to battle achievements, and there are no battles here.  The
+#: shape travels complete anyway, so a reader that indexes ``groups``/``medals``
+#: finds the dictionaries instead of ``None``.
+ACHIEVEMENTS_REWARD = {"isEnabled": False, "groups": {}, "medals": {}}
+
 #: ``accounts`` are indexed by nation id, so the tables must cover every nation
 #: the client knows (``nations.NAMES`` has ten of them, ``NONE_INDEX`` is 15).
 NATION_TABLE_SIZE = 16
@@ -108,34 +138,54 @@ CUSTOMIZATION_DAYS = 7
 Price = Tuple[int, int]
 
 
-def _empty_items(prices: Dict[int, Price]) -> dict:
-    """The ``items`` section: prices plus every table a requester indexes."""
+def _items_section(catalog: Catalog, prices: Dict[int, Price]) -> dict:
+    """The ``items`` section: prices plus every table a requester indexes.
+
+    The appearance tables are the installation's own: the legacy camouflage,
+    inscription and player emblem price factors with their ``notInShop`` lists
+    come from ``vehicles/common/customization.xml``, ``vehicles/<nation>/
+    customization.xml`` and ``common/player_emblems.xml`` (exactly the files the
+    client's item data collects into ``pricesToCollect``), and
+    ``vehicleCamouflagePriceFactors`` is the per-vehicle
+    ``<camouflage><priceFactor>``.  A requester indexes the nation arrays
+    directly, so they always carry every nation id.
+    """
+    legacy = catalog.legacy_customization
+    not_in_shop = catalog.not_in_shop_items()
     return {
         "itemPrices": dict(prices),
+        # The installation's ``list.xml`` has no ``<rent>`` section for any
+        # vehicle and no ``sellPriceFactor``/``sellForGold``/``cannotBeBought``
+        # flag either, so these four tables are exactly what the client's own
+        # item data would collect from this installation: vehicles are sold at
+        # the shop's ``sellPriceFactor`` for credits.
         "vehiclesRentPrices": {},
         "vehiclesToSellForGold": set(),
         "vehicleSellPriceFactors": {},
-        "notInShopItems": set(),
         "vehiclesNotToBuy": set(),
+        "notInShopItems": set(not_in_shop),
         # Customization 2.0 and the legacy requester index these arrays by
         # nation id without a default, so they always carry every nation.
-        "camouflagePriceFactors": [{} for _index in range(NATION_TABLE_SIZE)],
-        "notInShopCamouflages": [set() for _index in range(NATION_TABLE_SIZE)],
-        "inscriptionGroupPriceFactors": [{} for _index in range(NATION_TABLE_SIZE)],
-        "notInShopInscriptionGroups": [set() for _index in range(NATION_TABLE_SIZE)],
-        "playerEmblemGroupPriceFactors": {},
-        "notInShopPlayerEmblemGroups": set(),
-        "vehicleCamouflagePriceFactors": {},
+        "camouflagePriceFactors": legacy.camouflage_factors(NATION_TABLE_SIZE),
+        "notInShopCamouflages": legacy.camouflage_hiddens(NATION_TABLE_SIZE),
+        "inscriptionGroupPriceFactors": legacy.inscription_factors(NATION_TABLE_SIZE),
+        "notInShopInscriptionGroups": legacy.inscription_hiddens(NATION_TABLE_SIZE),
+        "playerEmblemGroupPriceFactors": legacy.emblem_factors(),
+        "notInShopPlayerEmblemGroups": legacy.emblem_hiddens(),
+        "vehicleCamouflagePriceFactors": catalog.vehicle_camouflage_price_factors(),
         "vehicleHornPriceFactors": {},
     }
 
 
-def _goodies_table() -> dict:
+def _goodies_table(goodies: GoodieTable = None) -> dict:
     """The goodies section: the definitions, their prices and the exclusions."""
-    return {"goodies": {}, "prices": {}, "notInShop": []}
+    if goodies is None:
+        return {"goodies": {}, "prices": {}, "notInShop": []}
+    return goodies.shop_section()
 
 
-def build_shop(catalog: Catalog, revision: int = SHOP_REV) -> dict:
+def build_shop(catalog: Catalog, revision: int = SHOP_REV,
+               goodies: GoodieTable = None) -> dict:
     """The whole shop cache for ``CMD_SYNC_SHOP``.
 
     Every item the client can buy is priced from the installation's own
@@ -150,30 +200,35 @@ def build_shop(catalog: Catalog, revision: int = SHOP_REV) -> dict:
     # and the customization window prices its baskets with it, so the appearance
     # items travel in the same table.
     prices.update(catalog.customization.prices())
-    not_in_shop = set(catalog.customization.not_in_shop())
-    items = _empty_items(prices)
-    defaults = _empty_items(prices)
-    if not_in_shop:
-        # ``DefaultShopRequester.getHiddens`` is the list the UI greys out; the
-        # appearance items the client's own data marks ``notInShop`` (the legacy
-        # camouflages of the event, the ``all`` styles) are not for sale.
-        items["notInShopItems"] = set(not_in_shop)
-        defaults["notInShopItems"] = set(not_in_shop)
-    defaults.update(
-        {
-            "slotsPrices": SLOTS_PRICES,
-            "berthsPrices": BERTHS_PRICES,
-            "tankmanCost": TANKMAN_COST,
-            "premiumCost": dict(PREMIUM_COST),
-            "dropSkillsCost": _drop_skills_table(),
-            "paidRemovalCost": dict(DEVICE_REMOVAL_COST),
-            "paidDeluxeRemovalCost": dict(DELUXE_REMOVAL_COST),
-            "freeXPConversion": FREE_XP_CONVERSION,
-            "freeXPToTManXPRate": FREE_XP_TO_TMAN_XP_RATE,
-            "goodies": _goodies_table(),
-            "restore_config": _restore_config(),
-        }
-    )
+    # ``DefaultShopRequester.getHiddens`` is the list the UI greys out; every
+    # item the client's own data keeps out of the shop travels in it (the
+    # ``notInShop`` vehicles of ``list.xml`` and the appearance items of the
+    # second customization system - the legacy camouflages, inscriptions and
+    # emblems have hidden lists of their own).
+    items = _items_section(catalog, prices)
+    goodie_section = _goodies_table(goodies)
+    # ``ShopRequester._response`` hands this dictionary to
+    # ``DefaultShopRequester`` (``self.defaults.update(invData['defaults'])``)
+    # and every table that requester falls back to is read through
+    # ``getItemsData()`` - which is ``defaults['items']`` - so the whole items
+    # section travels nested inside it, exactly as the live server sent it.  The
+    # remaining keys are the ones ``DefaultShopRequester`` reads directly.
+    defaults = {
+        "items": _items_section(catalog, prices),
+        "slotsPrices": SLOTS_PRICES,
+        "berthsPrices": BERTHS_PRICES,
+        "tradeIn": dict(TRADE_IN),
+        "tankmanCost": TANKMAN_COST,
+        "premiumCost": dict(PREMIUM_COST),
+        "dropSkillsCost": _drop_skills_table(),
+        "paidRemovalCost": dict(DEVICE_REMOVAL_COST),
+        "paidDeluxeRemovalCost": dict(DELUXE_REMOVAL_COST),
+        "freeXPConversion": FREE_XP_CONVERSION,
+        "freeXPToTManXPRate": FREE_XP_TO_TMAN_XP_RATE,
+        "goodies": goodie_section,
+        "achievementsReward": dict(ACHIEVEMENTS_REWARD),
+        "restore_config": _restore_config(),
+    }
     return {
         "rev": int(revision),
         "sellPriceFactor": SELL_PRICE_FACTOR,
@@ -202,12 +257,14 @@ def build_shop(catalog: Catalog, revision: int = SHOP_REV) -> dict:
         "dailyXPFactor": 2,
         "refSystem": dict(REF_SYSTEM),
         "restore_config": _restore_config(),
-        "tradeIn": {},
+        # The client's ``TradeInData(**tradeIn)`` unpacks this dictionary into a
+        # named tuple, so it carries exactly the four keys it declares.
+        "tradeIn": dict(TRADE_IN),
         "camouflageCost": {CUSTOMIZATION_DAYS: (0, 50)},
         "playerInscriptionCost": {CUSTOMIZATION_DAYS: (0, 50)},
         "playerEmblemCost": {CUSTOMIZATION_DAYS: (0, 50)},
-        "goodies": _goodies_table(),
-        "achievementsReward": {},
+        "goodies": goodie_section,
+        "achievementsReward": dict(ACHIEVEMENTS_REWARD),
     }
 
 
@@ -238,13 +295,14 @@ def _restore_config() -> dict:
 class ShopBuilder(object):
     """Keeps the (expensive) price table of one installation."""
 
-    def __init__(self, catalog: Catalog):
+    def __init__(self, catalog: Catalog, goodies: GoodieTable = None):
         self.catalog = catalog
+        self.goodies = goodies
         self._payload: Optional[dict] = None
 
     def payload(self) -> dict:
         if self._payload is None:
-            self._payload = build_shop(self.catalog)
+            self._payload = build_shop(self.catalog, goodies=self.goodies)
         return self._payload
 
     def revision(self) -> int:
@@ -254,8 +312,14 @@ class ShopBuilder(object):
         """``(credits, gold)`` of one item, or ``None`` when it is not priced."""
         return self.payload()["items"]["itemPrices"].get(int(compact_descr))
 
+    def goodie_definitions(self) -> Dict[int, "GoodieTable"]:
+        """``{goodieID: definition}`` of the personal offers of the event."""
+        goodies = self.goodies
+        return dict(goodies.definitions) if goodies is not None else {}
+
 
 __all__ = [
+    "ACHIEVEMENTS_REWARD",
     "CHANGE_ROLE_COST",
     "DROP_SKILLS_COST",
     "CRYSTAL_EXCHANGE_RATE",

@@ -100,7 +100,7 @@ class Bridge(object):
         while not self._stop:
             if self._state != _STATE_CONNECTED:
                 if not self._connect():
-                    for _ in xrange(int(config.CONNECT_RETRY_PERIOD * 10)):
+                    for _ in range(int(config.CONNECT_RETRY_PERIOD * 10)):
                         if self._stop:
                             return
                         time.sleep(0.1)

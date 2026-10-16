@@ -83,17 +83,28 @@ Go through this in one session and note for every line: **works** / **fails**
 10. **Chests**: opening a chest of a level the account has works and asks for
     the decoration the window offers.
 11. **Discounts**: a variadic discount can be picked and shows up in the shop.
+    The offer of a level is a percent off one tank of that level (5 % on level
+    2 up to 50 % on level 10), the shop dialogue shows that very price, and
+    buying the tank pays it.  Every atmosphere level the tree reaches also
+    writes a line into the **service channel** (the message list in the
+    bottom left); `--no-announce` silences the whole service channel.
 12. **Tankwomen**: a box that grants a tankwoman asks for the nation/vehicle
     choice and the crew member ends up in the barracks.
 
 **Shop, garage and crew**
 
 13. The shop prices vehicles, modules, shells, consumables and optional
-    devices; buying and selling works and the wallet follows.
+    devices; buying and selling works and the wallet follows.  The wallet
+    tooltip in the header shows the gold/credits breakdown the server reports
+    for the balance request (gold and credits, the earned half of them).
 14. Buying a garage slot and barracks berths works.
 15. Buying premium account for gold works (the header shows the premium).
 16. Exchanging gold for credits and converting vehicle experience into free
     experience (including the free trade-in discount) works.
+    **Trade-in**: the dialog trades an owned premium tank for another premium
+    one - the new tank is charged minus half of the gold price of the old one,
+    the crew of the old one moves into the barracks (one free berth per crew
+    member is needed) and everything mounted on it returns to the depot.
 17. Mounting and dismounting modules, optional devices (including the **paid**
     removal of a non-removable one), ammunition and consumables works, and
     what is taken off comes back to the depot.
@@ -120,7 +131,9 @@ Go through this in one session and note for every line: **works** / **fails**
 26. The profile window opens and its **statistics** are the empty ones (see
     *What is expected to be empty* below), not an error dialog.
 27. The **awards** tab lists the achievements and medals of the client.
-28. The badges page opens and shows the badges of the installation.
+28. The badges page opens, shows the badges of the installation (a local
+    account is awarded every badge the installation describes, so the page has
+    something to show) and keeps the ones that are picked.
 29. Closing and reopening any of these screens does not break the hangar.
 
 **Persistence**
@@ -134,13 +147,22 @@ Go through this in one session and note for every line: **works** / **fails**
 These are not bugs, they are what the server is:
 
 * **Statistics stay at zero.**  The dossiers are empty because there are no
-  battles: no battles, no wins, no damage, no earned achievements, no badges to
-  show.  The screens themselves work.
+  battles: no battles, no wins, no damage, no achievements and no medals.  The
+  screens themselves work.  Badges are the one exception and deliberately so:
+  they come from the installation's own `badges.xml` and are awarded as earned,
+  so the badges page has data to show.
 * **Battles do not start.**  There is no battle server, so "В бой!" reports a
   server error instead of queueing.  Nothing in the New Year event needs a
   battle.
-* **Missions, promotions, friends, clans, platoons** - not implemented; the
-  event's own quests and notifications are.
+* **The shop's achievement-crystal section stays disabled.**  The reward field
+  the client renders next to the achievements travels as `isEnabled: False`,
+  because the installation's item data carries no per-group bonus or vehicle
+  multiplier for it; the window stays empty instead of erroring.
+* **Missions, promotions, friends, clans, platoons** - not implemented, and
+  there is no live mission/promotion feed to show: the notification mechanism
+  itself works (the event announces its start and every atmosphere level in the
+  service channel), but the missions and promotions of a live server are
+  decided by that server's own event data, which is not part of the client.
 
 ## 6. Common things that look like bugs
 
