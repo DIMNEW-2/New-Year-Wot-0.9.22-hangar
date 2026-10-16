@@ -6,7 +6,9 @@ The project serves the **account protocol of that client** from a local Python 3
 process, so the game runs offline with a working lobby:
 
 * a **New Year hangar** — the event space is switched on by the server's own
-  `cmd_change_hangar` notification (`spaces/h07_newyear_2015`),
+  `cmd_change_hangar` notification, which names the space the installation's
+  own packages carry (`spaces/h07_newyear_2018` on a 0.9.22 build; `--hangar`
+  overrides it),
 * **loot boxes and chests** — opening them hands out the official rewards and
   reports them through the client's `tokenQuests` system message,
 * the **New Year offensive** — decorations (toys), slots, crafting, the
@@ -17,7 +19,13 @@ process, so the game runs offline with a working lobby:
 
 Game data is **never** bundled: the server reads the player's own installation
 (`res/scripts/item_defs`, or the same tree inside `res/scripts.pkg` when the
-build ships packed scripts), so it always matches the client exactly.
+build ships packed scripts), so it always matches the client exactly.  It takes
+the build as it is — files kept in `res/packages`, members compressed or written
+in UTF-16/a legacy code page on their own, a renamed hangar space — and when a
+file really cannot be read, it says which file it was and what it contained
+(if you want the diagnosis, run `python3 -m server inspect --client <folder>`:
+it reports every archive, what could be opened and the first bytes of a file
+that could not be parsed).
 
 If the server cannot find the game data, ask it what it sees:
 
@@ -44,9 +52,9 @@ it prints the layout it found (or every place it looked) instead of a traceback.
    python3 -m server verify --client /path/to/World_of_Tanks
    ```
 
-   Everything the local server depends on shows up as `[ ok ]`; the two things
-   that come from the game itself (its packages and the mod) are warnings with
-   the exact command or path to fix them.
+   Everything the local server depends on shows up as `[ ok ]`; anything the
+   installation does not carry (the mod before it is installed, a data file the
+   build damaged) is a warning with the exact command or path to fix it.
 
 1. Start the server (it listens on `127.0.0.1:28422` by default):
 
@@ -95,10 +103,10 @@ it prints the layout it found (or every place it looked) instead of a traceback.
 
 | path | what it is |
 | --- | --- |
-| `server/game/` | game data (`item_defs` catalog), New Year event logic, quests/actions/notifications, reward payouts |
+| `server/game/` | game data (`item_defs` catalog, the payload/archive reader), New Year event logic, quests/actions/notifications, reward payouts |
 | `server/account_rpc/` | account state, command dispatch, protocol constants, socket server, persistence |
 | `server/proto/` | Python-2-compatible pickles and framing |
-| `server/loader.py`, `server/__main__.py` | finding the installation (unpacked or packed, nested folders), CLI (`serve`, `info`, `extract`, `inspect`) |
+| `server/loader.py`, `server/doctor.py`, `server/__main__.py` | finding the installation (unpacked or packed, nested folders), the hangar space of the build, the self check, CLI (`serve`, `verify`, `info`, `extract`, `inspect`; `--hangar <space>`) |
 | `client_mod/` | the in-client mod (bridge + fake login + account proxy) |
 | `tests/` | plain-Python test suite (`python3 tests/run_all.py --client …`) |
 | `docs/` | protocol notes, the event reference and `docs/testing.md` (the checklist for a run in the real client) |

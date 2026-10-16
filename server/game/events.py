@@ -63,8 +63,11 @@ EVENT_TYPE_BATTLE_QUEST = 2
 EVENT_TYPE_TOKEN_QUEST = 3
 
 #: ``client/gui/ClientHangarSpace`` - the event notification that swaps the
-#: hangar scene.  ``client/new_year/new_year_controller.NEW_YEAR_HANGAR_PATH``
-#: names the very same space.
+#: hangar scene.  The name is *not* fixed: ``NEW_YEAR_HANGAR_PATH`` of the
+#: decompiled controller is a leftover in some builds (the 0.9.22 CH one names
+#: its sounds ``hangar_h07_newyear_2018_*``), so the space the client actually
+#: ships is detected in its packages
+#: (``server.loader.guess_new_year_space``) and used instead of this default.
 NEW_YEAR_HANGAR_PATH = "h07_newyear_2015"
 CMD_CHANGE_HANGAR = "cmd_change_hangar"
 CMD_CHANGE_HANGAR_PREMIUM = "cmd_change_hangar_prem"
@@ -128,9 +131,15 @@ def _blob(payload) -> bytes:
 class EventDataBuilder:
     """Builds every ``eventsData`` payload of the New Year event."""
 
-    def __init__(self, catalog: Catalog, start_time: Optional[float] = None):
+    def __init__(self, catalog: Catalog, start_time: Optional[float] = None,
+                 hangar_path: str = None):
         self.catalog = catalog
         self.start_time = float(start_time if start_time is not None else time.time())
+        #: The hangar space the notification switches the client to.  A build
+        #: that ships another space gets that one (see
+        #: :data:`NEW_YEAR_HANGAR_PATH`); ``python3 -m server --hangar``
+        #: overrides it.
+        self.hangar_path = str(hangar_path or NEW_YEAR_HANGAR_PATH)
         #: ``{chestID: bonus}`` of the chests that were opened (see
         #: :meth:`set_chest_loot`); the baseline of a closed chest comes from
         #: :data:`CHEST_QUESTS`.
@@ -345,7 +354,12 @@ class EventDataBuilder:
             "requiredTokens": list(required_tokens or ()),
         }
 
-    def hangar_notification(self, notification_type: str, path: str = NEW_YEAR_HANGAR_PATH) -> dict:
+    def set_hangar_path(self, path: str) -> None:
+        """Use another hangar space (``--hangar``, the detected one)."""
+        if path:
+            self.hangar_path = str(path)
+
+    def hangar_notification(self, notification_type: str, path: str = None) -> dict:
         """One ``cmd_change_hangar`` notification.
 
         ``gui.ClientHangarSpace.__onEventNotificationsChanged`` parses the
@@ -355,7 +369,8 @@ class EventDataBuilder:
         """
         return self.notification(
             notification_type,
-            json.dumps({"hangar": path, "visibilityMask": "FFFFFFFF"}),
+            json.dumps({"hangar": str(path or self.hangar_path),
+                        "visibilityMask": "FFFFFFFF"}),
         )
 
     def action_notification(self, text: dict, event_type: str = ACTION_NOTIFY_TYPE) -> dict:

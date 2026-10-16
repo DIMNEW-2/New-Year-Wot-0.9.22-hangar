@@ -5,8 +5,8 @@ What works today, and what is still missing or unverified.
 ## Working (covered by `tests/`)
 
 * **Self check** — `python3 -m server verify --client <game folder>` reads the
-  installation (game data, New Year definitions, crew name lists), looks for the
-  New Year hangar space inside the client's packages and for the installed mod,
+  installation (game data, New Year definitions, crew name lists), finds the New
+  Year hangar space inside the client's packages and looks for the installed mod,
   starts the server on a free port and then runs a whole session over the wire
   (handshake, account diff, streamed price cache, opening a loot box, a garage
   command, and an unsupported command that has to be refused).  It is the one
@@ -20,7 +20,13 @@ What works today, and what is still missing or unverified.
   of a number the player sees wrong.
 * **Game data** — the catalogue is read from the player's own `item_defs`
   (vehicles, modules with their prices, the New Year definitions) and validated
-  (`python3 -m server info`).
+  (`python3 -m server info`).  The reader takes the build as it is: loose files
+  or a `res/packages/scripts.pkg`, members compressed on their own (gzip, zlib,
+  raw deflate, bzip2, xz, zstd, a one-file zip around the file), UTF-16 or a
+  legacy code page (`server/game/payload.py`).  Anything it cannot read is
+  reported with the file name, its format, its encoding and its first bytes
+  (`server/game/defs.py`), so a broken build is a message, not a bare
+  `cannot parse XML`.
 * **Account** — a local account with a garage (386 researchable vehicles by
   default, `--garage premium|all`), crew (real names and icons from the client's
   own tankmen configs), credits/gold/free XP, slots and berths.
@@ -159,7 +165,8 @@ What works today, and what is still missing or unverified.
   quests (including one hidden quest per chest, which is where a chest's loot
   travels), the event action, the in-game event state and the notifications.
   The notification `cmd_change_hangar` switches the client's hangar space to
-  `spaces/h07_newyear_2015` (`gui/ClientHangarSpace.py`), and every
+  the space the installation's own packages carry, detected once at start-up
+  (`gui/ClientHangarSpace.py`; `--hangar` overrides it), and every
   notification *without* a `cmd_`/`promo_` prefix becomes a message of the
   lobby's service channel (`SystemMessagesInterface` ->
   `ActionNotificationFormatter`), which is how the server announces the running
@@ -224,10 +231,15 @@ What works today, and what is still missing or unverified.
   `client_mod/.../account_proxy.py`; `WOTNY_VERBOSE=1` logs them).  The service
   messages themselves do not need it: they reach the client through the
   notification list and the chat actions of the account.
-* **The New Year space itself** (`spaces/h07_newyear_2015`) has to exist in the
-  client's packages.  If a build ships another space name, change
-  `server/game/events.py::NEW_YEAR_HANGAR_PATH` (the client's own
-  `gui/hangars.xml` `default_hangar` is a good hint).
+* **The New Year space itself** has to exist in the client's packages - the
+  server does not assume a name: it scans the packages for
+  `spaces/<name>/space.settings` (`server/loader.py::find_spaces`) and prefers
+  the event spaces of 0.9.22 (`h07_newyear_2018`, then 2015/2017/2016), then any
+  space whose name mentions the New Year; the detected space is what the
+  `cmd_change_hangar` notification carries and what `verify` prints.  A build
+  whose space is named in a way that is recognized as neither needs
+  `--hangar <name>` (the client's own `gui/hangars.xml` `default_hangar` is a
+  good hint).
 * **Battles** are out of scope: no `Avatar`, no arena, no battle results.  The
   client's battle commands (`CMD_ENQUEUE_*`, the platoon/`CMD_PRB_*` family, the
   queue info requests) are answered with ``unknown_command``, so the buttons

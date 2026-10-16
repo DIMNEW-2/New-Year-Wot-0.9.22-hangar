@@ -22,6 +22,7 @@ from typing import Dict, Optional
 
 from .game import tankmen as tankmen_module
 from .game import achievements_reward as achievements_reward_module
+from .game import payload as payload_module
 from .game.catalog import Catalog
 from .game.defs import DefsError, find_client_script_package as _find_package, open_defs
 
@@ -35,6 +36,7 @@ ITEM_DEFS_CANDIDATES = (
 #: The scripts travel either unpacked (``res/scripts``) or inside an archive
 #: (``res/scripts.pkg``); a release installation ships the archive.
 SCRIPTS_CANDIDATES = (
+    os.path.join("res", "packages", "scripts.pkg"),
     os.path.join("res", "scripts.pkg"),
     os.path.join("res", "scripts"),
     os.path.join("scripts.pkg"),
@@ -194,7 +196,10 @@ def _layout_here(root: str, tried: list) -> Optional[ClientLayout]:
     if scripts is None:
         # An unpacked ``item_defs`` tree is enough on its own: the surrounding
         # folder is the ``scripts`` folder the item definitions belong to.
-        scripts = os.path.dirname(item_defs)
+        # When the definitions came out of a package, the package *is* the
+        # scripts tree - naming its folder (``res/packages``) would send every
+        # later reader looking for ``res/packages/common/…``.
+        scripts = item_defs if os.path.isfile(item_defs) else os.path.dirname(item_defs)
     server_xml = None
     for candidate in SERVER_XML_CANDIDATES:
         path = os.path.join(root, candidate)
@@ -225,6 +230,101 @@ def find_client_script_package(client_dir: str) -> Optional[str]:
         if _archive_has_item_defs(path):
             return path
     return _find_package(client_dir)
+
+
+#: The file every hangar space carries; the client resolves it through
+#: ``ResMgr.openSection(path + '/space.settings')``, which searches the packages.
+SPACE_SETTINGS = "space.settings"
+
+#: The hangar spaces of the New Year events, newest first.  A build ships the
+#: ones it uses, and the space the *client* can load is the one that has to
+#: travel in the notification - the constant of the decompiled controller
+#: (``h07_newyear_2015``) is a leftover in some builds (0.9.22 CH names its
+#: sounds ``hangar_h07_newyear_2018_*``), so the installation decides.
+NEW_YEAR_SPACES = ("h07_newyear_2018", "h07_newyear_2015", "h07_newyear_2017",
+                   "h07_newyear_2016")
+
+
+def package_archives(client_root: str) -> list:
+    """Every ``.pkg``/``.zip`` of an installation, in directory order.
+
+    ``res/packages`` is where a release build keeps them; a build that puts
+    them straight into ``res`` is found too.
+    """
+    found = []
+    seen = set()
+    for folder in (os.path.join(client_root, "res", "packages"),
+                   os.path.join(client_root, "res"),
+                   client_root):
+        if not os.path.isdir(folder):
+            continue
+        try:
+            names = sorted(os.listdir(folder))
+        except OSError:
+            continue
+        for name in names:
+            path = os.path.join(folder, name)
+            if not os.path.isfile(path):
+                continue
+            if os.path.splitext(name)[1].lower() not in (".pkg", ".zip"):
+                continue
+            key = os.path.abspath(path).lower()
+            if key not in seen:
+                seen.add(key)
+                found.append(path)
+    return found
+
+
+def find_spaces(client_root: str, archives: list = None):
+    """The hangar spaces an installation ships.
+
+    Returns ``(names, stats)``: every ``<name>/space.settings`` member of every
+    package (the space of the New Year event is one of them), and counters a
+    report can print - how many archives were looked at, how many of them are
+    readable, and how many members were seen.
+    """
+    names = set()
+    stats = {"archives": 0, "readable": 0, "members": 0}
+    for path in (package_archives(client_root) if archives is None else archives):
+        stats["archives"] += 1
+        try:
+            with zipfile.ZipFile(path) as archive:
+                stats["readable"] += 1
+                for info in archive.infolist():
+                    member = info.filename.replace("\\", "/").strip("/")
+                    if not member:
+                        continue
+                    stats["members"] += 1
+                    if member.rsplit("/", 1)[-1].lower() != SPACE_SETTINGS:
+                        continue
+                    parent = member.rsplit("/", 2)[-2] if "/" in member else ""
+                    if parent:
+                        names.add(parent)
+        except (zipfile.BadZipFile, OSError, RuntimeError):
+            continue
+    return sorted(names), stats
+
+
+def guess_new_year_space(client_root: str, prefer=NEW_YEAR_SPACES, spaces: list = None):
+    """The New Year space this installation can actually load.
+
+    Returns ``(space or None, spaces, stats)``.  The spaces of
+    :data:`NEW_YEAR_SPACES` are tried first (newest build first), then any name
+    that mentions the event - a build that renamed its space still gets a hangar
+    instead of a black screen.
+    """
+    if spaces is None:
+        spaces, stats = find_spaces(client_root)
+    else:
+        stats = {"archives": 0, "readable": 0, "members": 0}
+    for name in prefer:
+        if name in spaces:
+            return name, spaces, stats
+    for name in spaces:
+        lowered = name.lower()
+        if "newyear" in lowered or "new_year" in lowered or "new-year" in lowered:
+            return name, spaces, stats
+    return None, spaces, stats
 
 
 def _archive_names(client_dir: str) -> list:
@@ -381,77 +481,114 @@ def load_catalog(path_or_client: str) -> Catalog:
     return catalog
 
 
+def _looks_like_scripts_tree(path: str) -> bool:
+    """``True`` for a folder that holds the client's Python tree."""
+    if not path or not os.path.isdir(path):
+        return False
+    return any(os.path.isdir(os.path.join(path, name))
+               for name in ("common", "client", "client_common", "item_defs",
+                            "entity_defs", "gui", "helpers"))
+
+
+def _folder_script_reader(folder: str):
+    def read_from_folder(rel_path, _folder=folder):
+        path = os.path.join(_folder, rel_path.replace("/", os.sep))
+        try:
+            with open(path, "rb") as handle:
+                data = handle.read()
+        except OSError:
+            return None
+        # The same tolerance the ``item_defs`` reader has: a script a build
+        # wrote in UTF-16 (or wrapped in a codec) still reads.
+        return payload_module.read_payload(data)[0]
+
+    return read_from_folder
+
+
+def _archive_script_reader(archive: str):
+    def read_from_archive(rel_path, _archive=archive):
+        wanted = "/" + rel_path.lower()
+        with_suffix = "/scripts" + wanted
+        with_res = "/res/scripts" + wanted
+        try:
+            with zipfile.ZipFile(_archive) as handle:
+                for info in handle.infolist():
+                    name = info.filename.replace("\\", "/").lower().lstrip("/")
+                    if name.endswith(wanted) or name.endswith(with_suffix) \
+                            or name.endswith(with_res):
+                        return payload_module.read_payload(handle.read(info.filename))[0]
+        except (zipfile.BadZipFile, OSError, RuntimeError):
+            return None
+        return None
+
+    return read_from_archive
+
+
 def client_script_reader(client_root: str):
     """A callable reading one file of an installation's ``scripts`` tree.
 
-    The tree of a release build lives in ``res/scripts.pkg`` and an unpacked one
-    in ``res/scripts``; both are understood, and the folder may be named
-    directly (the ``scripts`` folder itself, a ``scripts.pkg``) or be the client
-    root.  The returned callable answers a relative path (``common/…``) with the
+    The tree of a release build lives in a package (``res/packages/scripts.pkg``
+    of the supported build, ``res/scripts.pkg`` of others) and an unpacked one
+    in ``res/scripts``; both are understood, and the argument may be the client
+    root, the ``scripts`` folder itself or a package.  The returned callable
+    answers a relative path (``common/dossiers2/custom/records.py``) with the
     text of the file or ``None`` - a reader that never raises, so a caller can
     use it against any installation.
     """
-    folder = None
+    root = _normalise_root(client_root) or client_root
+    folders = []
+    archives = []
     try:
         layout = find_client(client_root)
     except ClientNotFound:
         layout = None
     if layout is not None:
-        folder = layout.scripts
-    if not folder:
-        root = _normalise_root(client_root)
-        for candidate in ([root] if root else []) + [os.path.join(root, name)
-                                                     for name in ("res", "scripts", "common")]:
-            if not candidate or not os.path.isdir(candidate):
-                continue
-            if os.path.isdir(os.path.join(candidate, "common")):
-                folder = candidate
-                break
-            if os.path.isdir(os.path.join(candidate, "res", "scripts")):
-                folder = os.path.join(candidate, "res", "scripts")
-                break
-    if not folder and os.path.isfile(client_root or "") and _is_script_package(client_root):
-        folder = client_root
-    if folder and os.path.isdir(folder):
-        def read_from_folder(rel_path, _folder=folder):
-            path = os.path.join(_folder, rel_path.replace("/", os.sep))
-            try:
-                with open(path, "r", encoding="utf-8", errors="replace") as handle:
-                    return handle.read()
-            except OSError:
-                return None
+        # The layout is the best hint there is: ``scripts`` is a folder or the
+        # package the item definitions came from.
+        if layout.scripts and os.path.isfile(layout.scripts):
+            archives.append(layout.scripts)
+        elif layout.scripts:
+            folders.append(layout.scripts)
+        if layout.item_defs and os.path.isfile(layout.item_defs):
+            archives.append(layout.item_defs)
+    if root and os.path.isfile(root) and _is_script_package(root):
+        archives.insert(0, root)
+    if root and os.path.isdir(root):
+        folders.extend([root,
+                        os.path.join(root, "res", "scripts"),
+                        os.path.join(root, "scripts"),
+                        os.path.join(root, "res_mods", "0.9.22.0.1", "scripts")])
+        folder = os.path.dirname(root)
+        if _looks_like_scripts_tree(folder):
+            folders.append(folder)
+    try:
+        package = find_client_script_package(root if os.path.isdir(root or "") else
+                                             os.path.dirname(root or ""))
+    except Exception:  # noqa: BLE001 - a diagnostic reader never raises
+        package = None
+    if package:
+        archives.append(package)
 
-        return read_from_folder
-
-    archive = None
-    if folder and os.path.isfile(folder):
-        archive = folder
-    else:
-        archive = find_client_script_package(_normalise_root(client_root) or client_root)
-    if archive:
-        def read_from_archive(rel_path, _archive=archive):
-            wanted = "/" + rel_path.lower()
-            with_suffix = "/scripts" + wanted
-            try:
-                with zipfile.ZipFile(_archive) as handle:
-                    for info in handle.infolist():
-                        name = info.filename.replace("\\", "/").lower().lstrip("/")
-                        if name.endswith(wanted) or name.endswith(with_suffix):
-                            return handle.read(info.filename).decode("utf-8", "replace")
-            except (zipfile.BadZipFile, OSError, RuntimeError):
-                return None
-            return None
-
-        return read_from_archive
+    for folder in folders:
+        if _looks_like_scripts_tree(folder):
+            return _folder_script_reader(folder)
+    for archive in archives:
+        if archive and os.path.isfile(archive):
+            return _archive_script_reader(archive)
 
     def no_scripts(rel_path):
         return None
 
     return no_scripts
 
+def load_tankmen_configs(client_root: str, nations=None, errors: list = None
+                         ) -> Dict[str, tankmen_module.NationConfig]:
+    """Read ``item_defs/tankmen/<nation>.xml`` of the installation.
 
-def load_tankmen_configs(client_root: str, nations=None) -> Dict[str, tankmen_module.NationConfig]:
-    """Read ``item_defs/tankmen/<nation>.xml`` of the installation."""
+    ``errors`` (a list, when the caller passes one) collects why a nation's
+    file could not be read - the doctor shows the first reason, because "no crew
+    name lists" is a symptom and the reason is the thing to act on.
+    """
     from .game import ny_constants as nyc
 
     source = open_client_defs(client_root)
@@ -460,7 +597,9 @@ def load_tankmen_configs(client_root: str, nations=None) -> Dict[str, tankmen_mo
         for nation in nations or nyc.NATIONS:
             try:
                 configs[nation] = tankmen_module.read_nation_config(source, nation)
-            except Exception:
+            except Exception as error:  # noqa: BLE001 - the data decides
+                if errors is not None and len(errors) < 3:
+                    errors.append("tankmen/%s.xml: %s" % (nation, error))
                 continue
     finally:
         source.close()
@@ -470,7 +609,12 @@ def load_tankmen_configs(client_root: str, nations=None) -> Dict[str, tankmen_mo
 __all__ = [
     "ClientLayout",
     "ClientNotFound",
+    "NEW_YEAR_SPACES",
+    "SPACE_SETTINGS",
     "client_script_reader",
+    "find_spaces",
+    "guess_new_year_space",
+    "package_archives",
     "candidate_client_roots",
     "describe_installation",
     "find_client",

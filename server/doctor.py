@@ -24,8 +24,6 @@ import logging
 import os
 import socket
 import sys
-import time
-import zipfile
 import zlib
 from typing import List, Optional, Sequence, Tuple
 
@@ -43,10 +41,14 @@ FAIL = "fail"
 
 _MARKS = {OK: "[ ok ]", WARN: "[warn]", FAIL: "[FAIL]"}
 
-#: The hangar space the event switches the client to
-#: (``server/game/events.py::NEW_YEAR_HANGAR_PATH``); ``ClientHangarSpace``
+#: How many space names a report may print before it becomes a wall of text.
+SPACES_SHOWN = 10
+
+#: The hangar space a build without a detectable New Year space would fall back
+#: to (``server/game/events.py::NEW_YEAR_HANGAR_PATH``); ``ClientHangarSpace``
 #: resolves it through ``ResMgr.openSection(path + '/space.settings')``, which
-#: searches the packages of the installation.
+#: searches the packages of the installation - so the space has to *be* there,
+#: which is why the real one is detected (``server.loader.guess_new_year_space``).
 HANGAR_SPACE = "spaces/h07_newyear_2015"
 
 #: Where the mod has to be for the client to load it (``client_mod/README.md``).
@@ -120,51 +122,35 @@ class Report(object):
 # ---------------------------------------------------------------------------
 # the installation
 # ---------------------------------------------------------------------------
-def _packages_to_search(client_root: str) -> List[str]:
-    """The archives of an installation, the ones that hold spaces first."""
-    folders = [os.path.join(client_root, "res", "packages"),
-               os.path.join(client_root, "res"),
-               client_root]
-    found: List[str] = []
-    for folder in folders:
-        if not os.path.isdir(folder):
-            continue
-        for name in sorted(os.listdir(folder)):
-            path = os.path.join(folder, name)
-            if os.path.isfile(path) and os.path.splitext(name)[1].lower() == ".pkg":
-                found.append(path)
-        if found:
-            break
+def find_hangar_space(client_root: str, space: str = None) -> Tuple[bool, str]:
+    """Look for the New Year hangar space inside the packages.
 
-    def rank(path: str):
-        lowered = os.path.basename(path).lower()
-        interesting = any(word in lowered for word in ("space", "hangar", "newyear",
-                                                       "new_year"))
-        return (0 if interesting else 1, lowered)
-
-    return sorted(found, key=rank)[:ARCHIVES_TO_SCAN]
-
-
-def find_hangar_space(client_root: str, space: str = HANGAR_SPACE) -> Tuple[bool, str]:
-    """Look for ``spaces/<name>/space.settings`` inside the packages."""
-    wanted = (space + "/space.settings").lower().lstrip("/")
-    name = os.path.basename(space).lower()
-    archives = _packages_to_search(client_root)
-    for path in archives:
-        if name in os.path.basename(path).lower():
-            return True, "the package %s is named after it" % os.path.basename(path)
-        try:
-            with zipfile.ZipFile(path) as archive:
-                for info in archive.infolist():
-                    member = info.filename.replace("\\", "/").lower().lstrip("/")
-                    if member.endswith(wanted):
-                        return True, "%s is in %s" % (info.filename.strip("/"),
-                                                      os.path.basename(path))
-        except (zipfile.BadZipFile, OSError, RuntimeError):
-            continue
-    if not archives:
+    ``space`` names one space to look for (``spaces/<name>/space.settings``,
+    the form the client resolves); without it the spaces of
+    :data:`server.loader.NEW_YEAR_SPACES` are tried in order and any name that
+    mentions the event is accepted - a build that renamed its space still gets a
+    hangar instead of a black screen.
+    """
+    _names, stats = loader.find_spaces(client_root)
+    if not stats["archives"]:
         return False, "the installation has no res/packages to look in"
-    return False, "searched %d package(s)" % len(archives)
+    if space:
+        wanted = os.path.basename(space).lower()
+        for name in loader.find_spaces(client_root)[0]:
+            if name.lower() == wanted:
+                return True, "spaces/%s is in the packages" % name
+        return False, "looked for spaces/%s in %d package(s)" % (wanted, stats["archives"])
+    found, spaces, stats = loader.guess_new_year_space(client_root)
+    if found:
+        return True, ("spaces/%s/space.settings is in the packages (this build "
+                      "ships %d space(s))" % (found, len(spaces)))
+    if spaces:
+        return False, ("%d space(s) found, none of them a New Year one: %s\n"
+                       "pass --hangar <name> to pick one of them"
+                       % (len(spaces), ", ".join(spaces[:10])))
+    return False, ("no space at all in %d package(s) (%d readable) - is this the "
+                   "installation the game runs from?"
+                   % (stats["archives"], stats["readable"]))
 
 
 def check_installation(client_root: str, catalog=None, tankmen_configs=None) -> Report:
@@ -196,11 +182,15 @@ def check_installation(client_root: str, catalog=None, tankmen_configs=None) -> 
             report.fail("the New Year definitions are empty", detail)
 
     if tankmen_configs is None:
+        reasons: List[str] = []
         try:
-            tankmen_configs = loader.load_tankmen_configs(client_root)
+            tankmen_configs = loader.load_tankmen_configs(client_root, errors=reasons)
         except Exception as error:  # noqa: BLE001 - the data decides
             tankmen_configs = {}
-            report.warn("the crew name lists cannot be read", str(error))
+            reasons.append(str(error))
+        reasons_holder = reasons
+    else:
+        reasons_holder = []
     if tankmen_configs:
         report.ok("the crew name lists are there",
                   "%d nations (crew members and the New Year tankwomen)"
@@ -208,17 +198,25 @@ def check_installation(client_root: str, catalog=None, tankmen_configs=None) -> 
     else:
         report.warn("no crew name lists",
                     "crew members and the New Year tankwomen would be missing;\n"
-                    "the installation needs res/scripts or res/scripts.pkg")
+                    "looked in %s" % loader.source_description(client_root)
+                    + ("\nhere is why:\n  " + "\n  ".join(reasons_holder)
+                       if reasons_holder else ""))
 
     found, detail = find_hangar_space(layout.root)
     if found:
         report.ok("the New Year hangar space is in the packages", detail)
     else:
-        report.warn("the New Year hangar space (%s) was not found" % HANGAR_SPACE,
+        report.warn("the New Year hangar space was not found",
                     "%s - the hangar would stay the stock one.\n"
-                    "Point server/game/events.py::NEW_YEAR_HANGAR_PATH at the space "
-                    "this build\nships, or look at gui/hangars.xml in the client for "
-                    "the name it uses." % detail)
+                    "Pass --hangar <name> to use another space of this build (the "
+                    "client's\nown gui/hangars.xml lists them)." % detail)
+
+    # The session below builds the very account the game gets, so the space the
+    # notification will name is part of the report.
+    space, spaces, _stats = loader.guess_new_year_space(layout.root)
+    if space:
+        report.ok("the event will use the hangar space of this build",
+                  "spaces/%s of %d space(s)" % (space, len(spaces)))
 
     mod = os.path.join(layout.root, MOD_RELATIVE_PATH)
     if os.path.isfile(mod):
@@ -319,10 +317,11 @@ def _first_box(state: AccountState) -> Optional[str]:
     return None
 
 
-def check_session(catalog, tankmen_configs=None, stream=None) -> Report:
+def check_session(catalog, tankmen_configs=None, stream=None, hangar_path=None) -> Report:
     """Start the server on a free port and drive it like the client does."""
     report = Report("A session with the local server")
-    state = AccountState.new(catalog, tankmen_configs=tankmen_configs or {})
+    state = AccountState.new(catalog, tankmen_configs=tankmen_configs or {},
+                             hangar_path=hangar_path)
     try:
         server = AccountServer(state, host="127.0.0.1", port=0, save_path=None,
                                log=logging.getLogger("server.verify")).start()
@@ -529,8 +528,15 @@ def run(client: Optional[str] = None, catalog=None, source: Optional[str] = None
                     tankmen_configs = loader.load_tankmen_configs(root)
                 except Exception:  # noqa: BLE001 - reported by the installation check
                     tankmen_configs = {}
+            # The space the event switches to is the one this client ships.
+            hangar_path = None
+            if root:
+                try:
+                    hangar_path = loader.guess_new_year_space(root)[0]
+                except OSError:
+                    hangar_path = None
             session_report = check_session(catalog, tankmen_configs=tankmen_configs,
-                                           stream=stream)
+                                           stream=stream, hangar_path=hangar_path)
 
     installation.render(stream)
     failures, warnings = installation.failures, installation.warnings

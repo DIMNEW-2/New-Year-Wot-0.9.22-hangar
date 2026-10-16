@@ -202,6 +202,7 @@ class AccountState:
         credits: int = DEFAULT_CREDITS,
         gold: int = DEFAULT_GOLD,
         free_xp: int = DEFAULT_FREE_XP,
+        hangar_path: str = None,
     ):
         self.catalog = catalog
         self.name = name
@@ -257,7 +258,12 @@ class AccountState:
         self.dossier_fields: Dict[str, int] = {}
 
         self.tankman_factory = tankman_factory
-        self.events = EventDataBuilder(catalog, start_time=self.created_at)
+        #: The hangar space the event switches the client to - detected in the
+        #: packages of the installation (``server.loader.guess_new_year_space``)
+        #: or named with ``python3 -m server --hangar``.
+        self.hangar_path = str(hangar_path) if hangar_path else None
+        self.events = EventDataBuilder(catalog, start_time=self.created_at,
+                                       hangar_path=hangar_path)
         #: The vehicles the New Year boxes and chests hand out (built from the
         #: client's own vehicle catalogue, see :mod:`server.game.rewards`).
         self.vehicle_chooser = rewards_module.VehicleRewardChooser(catalog)
@@ -1474,6 +1480,7 @@ class AccountState:
             },
             "customization": self.customization.to_json(),
             "newYear": self.new_year.state.to_json(),
+            "hangarPath": self.events.hangar_path,
         }
 
     @classmethod
@@ -1552,6 +1559,8 @@ class AccountState:
                                   for item_type, values in state.items.items() if values}
         state.customization = customization_module.CustomizationInventory.from_json(
             payload.get("customization") or {})
+        state.events.set_hangar_path(payload.get("hangarPath") or "")
+        state.hangar_path = state.events.hangar_path
         state.new_year.state = ny_module.NewYearState.from_json(payload.get("newYear") or {}, catalog.new_year)
         state.new_year.tankmen = tankman_factory
         state.sync_tokens()

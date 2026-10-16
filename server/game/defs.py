@@ -20,6 +20,8 @@ import re
 import xml.etree.ElementTree as ElementTree
 import zipfile
 
+from . import payload as payload_module
+
 ITEM_DEFS_PREFIXES = (
     "scripts/item_defs/",
     "item_defs/",
@@ -153,12 +155,13 @@ def strip_xml_namespaces(text: str) -> str:
     return _TAG_PREFIX.sub(r"\1", text)
 
 
-def parse_xml(text: str) -> XmlSection:
+def parse_xml(text: str, origin: str = "") -> XmlSection:
     text = strip_xml_namespaces(text)
     try:
         root = ElementTree.fromstring(text)
     except ElementTree.ParseError as error:
-        raise DefsError("cannot parse XML: %s" % error)
+        raise DefsError("cannot parse XML%s: %s"
+                        % (" (%s)" % origin if origin else "", error))
     # The root element repeats the file name in the client data
     # (``<toys.xml>``); its children are the real sections.
     return _build(root)
@@ -173,17 +176,52 @@ class DefsSource:
         """Return the exported catalog when this source is a JSON export."""
         return None
 
-    def read_text(self, rel_path: str):
+    def read_bytes(self, rel_path: str):
+        """The raw bytes of one member, or ``None`` when it does not exist."""
         raise NotImplementedError
 
+    def read_text(self, rel_path: str):
+        """One member as text.
+
+        The bytes go through :mod:`server.game.payload` first, so a member that
+        a build compressed on its own (or wrote in UTF-16, or in the code page
+        of a localized build) reads like any other file.
+        """
+        data = self.read_bytes(rel_path)
+        if data is None:
+            return None
+        return payload_module.read_payload(data)[0]
+
     def has(self, rel_path: str) -> bool:
-        return self.read_text(rel_path) is not None
+        return self.read_bytes(rel_path) is not None
 
     def read_section(self, rel_path: str) -> XmlSection:
-        text = self.read_text(rel_path)
-        if text is None:
+        """One member parsed as XML.
+
+        A member that is not XML raises a :class:`DefsError` that *describes*
+        the payload - the format, the compression wrapper if there was one, the
+        encoding and the first bytes - because that message is what a user
+        reports and what a maintainer acts on.
+        """
+        data = self.read_bytes(rel_path)
+        if data is None:
             raise DefsError("missing client data file: %s" % rel_path)
-        return parse_xml(text)
+        text, _note = payload_module.read_payload(data)
+        try:
+            return parse_xml(text)
+        except DefsError as error:
+            raise DefsError("%s\n  parser: %s"
+                            % (payload_module.describe(rel_path, data, self.description),
+                               error))
+
+    def sniff(self, rel_path: str):
+        """A summary of one member (``python3 -m server inspect``)."""
+        data = self.read_bytes(rel_path)
+        return None if data is None else payload_module.sniff(data)
+
+    def members(self):
+        """The relative paths this source can read (may be empty)."""
+        return []
 
     def list_vehicle_files(self, nation: str):
         """Relative paths of ``vehicles/<nation>/*.xml`` (excluding ``list.xml``)."""
@@ -200,12 +238,20 @@ class DirectorySource(DefsSource):
         self.root = os.path.abspath(item_defs_dir)
         self.description = "directory %s" % self.root
 
-    def read_text(self, rel_path):
+    def read_bytes(self, rel_path):
         candidate = os.path.join(self.root, *rel_path.split("/"))
         if not os.path.isfile(candidate):
             return None
-        with open(candidate, "r", encoding="utf-8", errors="replace") as handle:
+        with open(candidate, "rb") as handle:
             return handle.read()
+
+    def members(self):
+        found = []
+        for folder, _dirs, names in os.walk(self.root):
+            for name in names:
+                path = os.path.join(folder, name)
+                found.append(os.path.relpath(path, self.root).replace(os.sep, "/"))
+        return sorted(found)
 
     def list_vehicle_files(self, nation):
         folder = os.path.join(self.root, "vehicles", nation)
@@ -245,14 +291,31 @@ class ZipSource(DefsSource):
                     self._index.setdefault(name[len(prefix):], name)
         self.description = "archive %s (%d item_defs entries)" % (self.path, len(self._index))
 
-    def read_text(self, rel_path):
+    def read_bytes(self, rel_path):
         member = self._index.get(rel_path) or self._index.get(rel_path.lower())
         if member is None:
             return None
         try:
-            return self._archive.read(member).decode("utf-8", "replace")
+            return self._archive.read(member)
         except KeyError:  # pragma: no cover - index drift
             return None
+        except (zipfile.BadZipFile, RuntimeError, NotImplementedError, EOFError) as error:
+            # An entry the archive cannot hand out (a compression method this
+            # Python does not implement, a truncated member): the reason is
+            # worth more than ``None``, and the caller reports it.
+            raise DefsError("cannot read %s from %s: %s" % (member, self.path, error))
+
+    def members(self):
+        return sorted(self._index)
+
+    def compression_methods(self) -> dict:
+        """``{method: entries}`` of the archive - a diagnostic for ``inspect``."""
+        counts = {}
+        for info in self._archive.infolist():
+            if info.is_dir():
+                continue
+            counts[info.compress_type] = counts.get(info.compress_type, 0) + 1
+        return counts
 
     def list_vehicle_files(self, nation):
         prefix = "vehicles/%s/" % nation
@@ -284,7 +347,7 @@ class CatalogJsonSource(DefsSource):
     def json_payload_placeholder(self):  # pragma: no cover - kept for symmetry
         return self.payload
 
-    def read_text(self, rel_path):
+    def read_bytes(self, rel_path):
         return None
 
     def list_vehicle_files(self, nation):

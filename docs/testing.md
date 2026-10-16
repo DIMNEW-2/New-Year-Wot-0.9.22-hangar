@@ -15,13 +15,17 @@ python3 -m server verify --client "C:/Games/World_of_Tanks"
 
 It reads the installation, starts the server on a free port, runs a session
 (handshake, account diff, streamed price cache, a loot box, a garage command,
-a refusal) and prints what it found.  Two warnings are expected and harmless:
+a refusal) and prints what it found.  The only warning that is expected before
+step 2 is `the client mod is not installed yet`.
 
-* `the New Year hangar space (spaces/h07_newyear_2015) was not found` - the
-  space is inside the client's packages, not in the loose scripts; the client
-  itself will tell you if it is missing (see *The lobby opens with the stock
-  hangar* below),
-* `the client mod is not installed yet` - before step 2.
+The check reads the installation the way the build writes it: data files may
+live in the loose `res/scripts` tree or inside `res/packages/scripts.pkg`, a
+member may be gzipped/zlibbed on its own, written in UTF-16 or in the code page
+of the build's language, and the New Year hangar space is whatever space the
+packages actually name (the server scans them and tells you which one it will
+use: `the event will use the hangar space of this build`).  If any of that
+fails, the report says **which file** and **what it contained** instead of
+`cannot parse XML`; pass `--hangar <name>` to override the detected space.
 
 ## 2. Install the mod
 
@@ -172,11 +176,12 @@ These are not bugs, they are what the server is:
 * **A dialog asking for the EULA or the "не отключать" warning** - the stock
   client on a fresh profile; accept it once.
 * **The lobby opens with the stock hangar** - the notification that switches
-  the space travels with the first account sync and names
-  `spaces/h07_newyear_2015` (`server/game/events.py::NEW_YEAR_HANGAR_PATH`).
-  If the installation ships another space name, the client's packages say
-  which one - it is also in the client's own `gui/hangars.xml`
-  (`default_hangar`).
+  the space travels with the first account sync and names the space `verify`
+  found in the packages (`spaces/h07_newyear_2018` for a build whose packages
+  carry it; the client's own `gui/hangars.xml` `default_hangar` is the other
+  hint).  If the space was not detected at all, the report of `verify` says
+  `the New Year hangar space ... was not found` together with the number of
+  archives searched - pass `--hangar <name>` to name it yourself.
 * **"waiting for the local server" in `wotny.log`** - the server is not running,
   or it is on another port than the mod's (`WOTNY_PORT`, default 28422).
 * **The mod is not loaded at all** - the version folder must match exactly
@@ -196,6 +201,19 @@ For every failing line of the checklist, the useful report is:
 3. the tail of `wotny.log` around that moment,
 4. the tail of `python.log` - especially a traceback (`File "scripts/…"`),
 5. the server's console output for the same moment (with `-v`).
+
+If the failure is in the installation itself (`verify` prints a FAIL line
+before the game is even started), the second command to run is `inspect` - it
+prints the same discovery in full, file by file, and its output is what a
+report needs:
+
+```bash
+python3 -m server inspect --client "C:/Games/World_of_Tanks"
+```
+
+It lists every archive it found, which of them it can open, the members it
+looked for and, for a file it cannot read, its format, encoding and first
+bytes - that is usually enough to tell a packed build from a damaged one.
 
 With those five things a wrong diff, a wrong price or a missing command is
 usually a one-line fix; without `python.log` the client-side half of the failure
