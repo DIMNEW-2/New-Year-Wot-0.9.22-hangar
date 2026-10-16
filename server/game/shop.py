@@ -59,12 +59,21 @@ FEMALE_PASSPORT_CHANGE_COST = 600
 #: recruiter window lists is exactly this table, indexed by
 #: ``tmanCostTypeIdx`` of ``CMD_BUY_TMAN``/``CMD_BUY_VEHICLE``.
 TANKMAN_COST = (
-    {"credits": 0, "gold": 0, "roleLevel": 50, "baseRoleLoss": 0.0,
-     "classChangeRoleLoss": 0.0, "isPremium": False},
-    {"credits": 20000, "gold": 0, "roleLevel": 75, "baseRoleLoss": 0.0,
-     "classChangeRoleLoss": 0.0, "isPremium": False},
+    {"credits": 0, "gold": 0, "roleLevel": 50, "baseRoleLoss": 0.2,
+     "classChangeRoleLoss": 0.2, "isPremium": False},
+    {"credits": 20000, "gold": 0, "roleLevel": 75, "baseRoleLoss": 0.1,
+     "classChangeRoleLoss": 0.1, "isPremium": False},
     {"credits": 0, "gold": 200, "roleLevel": 100, "baseRoleLoss": 0.0,
      "classChangeRoleLoss": 0.0, "isPremium": True},
+)
+
+#: ``<dropSkillsCost>`` of the client's ``Shop``: what forgetting every skill of
+#: a crew member costs and how much of the experience comes back (index 2 is the
+#: gold option of ``TankmanDropSkills``).
+DROP_SKILLS_COST = (
+    {"credits": 0, "gold": 0, "xpReuseFraction": 0.0},
+    {"credits": 20000, "gold": 0, "xpReuseFraction": 0.25},
+    {"credits": 0, "gold": 200, "xpReuseFraction": 1.0},
 )
 
 #: ``ShopRequester`` defaults for the premium account packages: days -> gold.
@@ -156,7 +165,7 @@ def build_shop(catalog: Catalog, revision: int = SHOP_REV) -> dict:
             "berthsPrices": BERTHS_PRICES,
             "tankmanCost": TANKMAN_COST,
             "premiumCost": dict(PREMIUM_COST),
-            "dropSkillsCost": {0: {"credits": 0, "gold": 0, "xpReuseFraction": 0.0}},
+            "dropSkillsCost": _drop_skills_table(),
             "paidRemovalCost": dict(DEVICE_REMOVAL_COST),
             "paidDeluxeRemovalCost": dict(DELUXE_REMOVAL_COST),
             "freeXPConversion": FREE_XP_CONVERSION,
@@ -185,7 +194,7 @@ def build_shop(catalog: Catalog, revision: int = SHOP_REV) -> dict:
         "changeRoleCost": CHANGE_ROLE_COST,
         "passportChangeCost": PASSPORT_CHANGE_COST,
         "femalePassportChangeCost": FEMALE_PASSPORT_CHANGE_COST,
-        "dropSkillsCost": {0: {"credits": 0, "gold": 0, "xpReuseFraction": 0.0}},
+        "dropSkillsCost": _drop_skills_table(),
         "paidRemovalCost": dict(DEVICE_REMOVAL_COST),
         "paidDeluxeRemovalCost": dict(DELUXE_REMOVAL_COST),
         "freeXPConversion": FREE_XP_CONVERSION,
@@ -202,15 +211,25 @@ def build_shop(catalog: Catalog, revision: int = SHOP_REV) -> dict:
     }
 
 
+def _drop_skills_table() -> dict:
+    """``{index: price}`` of ``CMD_TMAN_DROP_SKILLS`` (the client's own indices)."""
+    return {index: dict(cost) for index, cost in enumerate(DROP_SKILLS_COST)}
+
+
 def _restore_config() -> dict:
     """The recycle bin's windows and prices.
 
-    ``ShopCommonStats.tankmenRestoreConfig`` reads ``goldDuration``/``goldCost``
-    and ``ItemsRequester.getTankmen`` uses the duration to decide who is still
-    recoverable, so publishing zeros would hide the whole bin.
+    ``ShopRequester.tankmenRestoreConfig`` reads ``goldDuration``/``goldCost``
+    when the client is Chinese and ``creditsDuration``/``creditsCost`` otherwise,
+    and ``ItemsRequester.getTankmen`` throws a dismissed crew member away once
+    ``billableDuration`` is over - so both currencies are published and the
+    restore is free inside the window the client shows as free (the local server
+    never takes gold for something the player cannot see the price of).
     """
     return {
-        "tankmen": {"freeDuration": 0, "goldDuration": 86400, "goldCost": 0, "limit": 100},
+        "tankmen": {"freeDuration": 2592000, "goldDuration": 2592000,
+                    "goldCost": 100, "creditsDuration": 2592000,
+                    "creditsCost": 100000, "limit": 100},
         "vehicles": {"premiumDuration": 604800, "actionCooldown": 0,
                      "restorePriceModif": 1.0},
     }
@@ -238,6 +257,7 @@ class ShopBuilder(object):
 
 __all__ = [
     "CHANGE_ROLE_COST",
+    "DROP_SKILLS_COST",
     "CRYSTAL_EXCHANGE_RATE",
     "EXCHANGE_RATE",
     "FREE_XP_CONVERSION",

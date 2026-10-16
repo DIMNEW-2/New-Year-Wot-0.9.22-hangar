@@ -44,6 +44,25 @@ What works today, and what is still missing or unverified.
   (`CMD_BUY_AND_EQUIP_ITEM`).  Everything the client mounts leaves the depot and
   everything it takes off goes back into it, so the counts its panels price
   against are the counts the server charges for.
+* **The barracks** — a crew member is a descriptor, and every operation the
+  personal file offers rewrites it the way the client's own ``TankmanDescr``
+  would: learning a skill (`CMD_TMAN_ADD_SKILL`), forgetting them
+  (`CMD_TMAN_DROP_SKILLS`, the free/credits/gold prices of ``dropSkillsCost``
+  decide how much experience comes back), retraining one or a whole crew onto
+  another vehicle (`CMD_TMAN_RESPEC`, `CMD_TMAN_MULTI_RESPEC`, the prices and
+  the level losses of ``tankmanCost``), another role
+  (`CMD_TMAN_CHANGE_ROLE`, the ``ext`` of the answer is an ``EQUIP_TMAN_CODE``),
+  a new name inside the nation's own groups (`CMD_TMAN_PASSPORT`), crew
+  experience for gold (`CMD_TRAINING_TMAN`, the convert window's gold times
+  ``freeXPToTManXPRate``) and experience handed out directly
+  (`CMD_ADD_TMAN_XP`).  Dismissing a crew member (`CMD_DISMISS_TMAN`) takes it
+  out of the inventory and puts its descriptor into the recycle bin
+  (`recycleBin.tankmen.buffer`), which is where ``ItemsRequester`` looks for the
+  negative inventory ids the barracks lists; `CMD_TMAN_RESTORE` puts it back (as
+  long as a berth is free) and `CMD_RETURN_CREW` empties a whole vehicle into
+  the barracks.  The ranks a crew member is shown with follow the nation's own
+  ``<roleRanks>`` table, and a retraining keeps them, exactly like
+  ``TankmanDescr.__updateRankAtSkillLevelUp`` does.
 * **The wallet** — gold for credits (`CMD_EXCHANGE`, at the shop's
   `exchangeRate`), premium account packets (`CMD_PREMIUM`, at `premiumCost`,
   publishing `account.attrs`/`premiumExpiryTime`), vehicle experience into free
@@ -140,12 +159,15 @@ What works today, and what is still missing or unverified.
   installation (`server/game/events.py::collection_reward_customizations`, the
   `vehicleBound` and `notInShop` ones of the setting's nation) - an id the
   client's items cache does not know would break its awards window.
-* **The barracks commands are not implemented yet** (`CMD_DISMISS_TMAN`,
-  `CMD_TMAN_ADD_SKILL`, `CMD_TMAN_CHANGE_ROLE`, `CMD_TMAN_RESPEC`,
-  `CMD_TMAN_DROP_SKILLS`, `CMD_TMAN_MULTI_RESPEC`, `CMD_TMAN_RESTORE`,
-  `CMD_TMAN_PASSPORT`, `CMD_TRAINING_TMAN`, `CMD_RETURN_CREW`).  Crew can be
-  moved between vehicles and seats (`CMD_EQUIP_TMAN`, `CMD_BUY_AND_EQUIP_TMAN`)
-  and dismissed through the client only.
+* **Crew experience and retraining prices are the live game's own numbers.**
+  The client reads the *tables* out of the shop cache (``tankmanCost``,
+  ``dropSkillsCost``, ``passportChangeCost``), but the level a retraining costs
+  and the experience a dropped skill gives back are server-side rules: the local
+  server takes the ``roleLevel``/``baseRoleLoss``/``classChangeRoleLoss`` fields
+  of the same table and applies them through its own mirror of
+  ``TankmanDescr.respecialize``.  A restore from the recycle bin is free inside
+  the window the shop config calls free, so the local server never takes gold
+  for a price the client does not show.
 * **Dossiers and profile** (`CMD_REQ_ACCOUNT_DOSSIER`, `CMD_REQ_VEHICLE_DOSSIER`,
   `CMD_SET_DOSSIER_FIELD`, `CMD_SELECT_BADGES`, the global rating requests) are
   not answered: the statistics and profile screens stay empty.  Also

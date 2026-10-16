@@ -36,7 +36,12 @@ from typing import List, Optional, Sequence, Tuple
 from ..game import new_year as ny_module
 from ..proto import pack_stream, py2_dumps
 from . import commands as cmd
+# ``customization`` has to be imported before ``purchases``: the module imports
+# the shop's error class, and ``purchases`` pulls ``state`` in, which pulls
+# ``customization`` back in (``server/account_rpc/__init__`` documents the
+# layering).  ``barracks`` joins the same group for the same reason.
 from . import customization as customization_module
+from . import barracks as barracks_module
 from . import data as data_module
 from . import economics as economics_module
 from . import garage as garage_module
@@ -127,6 +132,7 @@ class RequestDispatcher:
         self.shop = purchases_module.Shopkeeper(state)
         self.garage = garage_module.Garage(state)
         self.customization = customization_module.CustomizationKeeper(state, self.shop)
+        self.barracks = barracks_module.Barracks(state, self.shop)
         self.wallet = economics_module.Wallet(state)
         self._message_id = 0
         self._handlers = {
@@ -153,6 +159,17 @@ class RequestDispatcher:
             cmd.CMD_SELL_C11N_ITEMS: self.on_sell_c11n_items,
             cmd.CMD_BUY_C11N_ITEMS: self.on_buy_c11n_items,
             cmd.CMD_VEH_APPLY_OUTFIT: self.on_apply_outfit,
+            cmd.CMD_DISMISS_TMAN: self.on_dismiss_tankman,
+            cmd.CMD_RETURN_CREW: self.on_return_crew,
+            cmd.CMD_TMAN_RESTORE: self.on_restore_tankman,
+            cmd.CMD_TMAN_ADD_SKILL: self.on_add_tankman_skill,
+            cmd.CMD_TMAN_DROP_SKILLS: self.on_drop_tankman_skills,
+            cmd.CMD_TMAN_RESPEC: self.on_respec_tankman,
+            cmd.CMD_TMAN_MULTI_RESPEC: self.on_multi_respec_tankman,
+            cmd.CMD_TMAN_CHANGE_ROLE: self.on_change_tankman_role,
+            cmd.CMD_TMAN_PASSPORT: self.on_change_tankman_passport,
+            cmd.CMD_TRAINING_TMAN: self.on_train_tankman,
+            cmd.CMD_ADD_TMAN_XP: self.on_add_tankman_xp,
             cmd.CMD_UNLOCK: self.on_unlock,
             cmd.CMD_EXCHANGE: self.on_exchange,
             cmd.CMD_FREE_XP_CONV: self.on_free_xp_conv,
@@ -351,6 +368,87 @@ class RequestDispatcher:
         veh_inv_id, slot = int(args[0]), int(args[1])
         tman = int(args[2]) if len(args) > 2 else -1
         return self._purchase(self.garage.equip_tankman, veh_inv_id, slot, tman)
+
+    # -- the barracks ----------------------------------------------------
+    def _barracks(self, action, *args) -> Response:
+        """Run one barracks operation and publish the diff it produced.
+
+        Unlike the shop, a mutation that points at something the account does
+        not have is a *bad request* (``RES_WRONG_ARGS``) rather than a refusal:
+        the client only sends what its own cache holds.
+        """
+        try:
+            outcome = action(*args)
+        except barracks_module.BarracksError as error:
+            self.log.info("barracks: refused (%s)", error)
+            return Response(code=error.code, error=error.error)
+        except (TypeError, ValueError, IndexError) as error:
+            self.log.info("barracks: bad arguments (%s)", error)
+            return Response(code=cmd.RES_WRONG_ARGS,
+                            error=barracks_module.ERROR_INVALID_OPERATION)
+        return Response(ext=outcome.get("ext"), diffs=[outcome["diff"]])
+
+    def on_dismiss_tankman(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_DISMISS_TMAN`` - ``Int3 (tmanInvID, 0, 0)``."""
+        return self._barracks(self.barracks.dismiss, int(args[0]))
+
+    def on_return_crew(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_RETURN_CREW`` - ``Int3 (vehInvID, 0, 0)``."""
+        return self._barracks(self.barracks.return_crew, int(args[0]))
+
+    def on_restore_tankman(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_TMAN_RESTORE`` - ``Int3 (tmanInvID, 0, 0)``."""
+        return self._barracks(self.barracks.restore, int(args[0]))
+
+    def on_add_tankman_skill(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_TMAN_ADD_SKILL`` - ``Int3 (tmanInvID, skillIdx, 0)``."""
+        values = _flat_args(args)
+        return self._barracks(self.barracks.add_skill, values[0], values[1])
+
+    def on_drop_tankman_skills(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_TMAN_DROP_SKILLS`` - ``Int3 (shopRev, tmanInvID, costIdx)``."""
+        values = _flat_args(args)
+        return self._barracks(self.barracks.drop_skills, values[1], values[2])
+
+    def on_respec_tankman(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_TMAN_RESPEC`` - ``Int4 (shopRev, tmanInvID, costIdx, vehCD)``."""
+        values = _flat_args(args)
+        return self._barracks(self.barracks.respec, values[1], values[2],
+                              values[3] if len(values) > 3 else 0)
+
+    def on_multi_respec_tankman(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_TMAN_MULTI_RESPEC`` - ``IntArr [shopRev, vehCD, invID, costIdx…]``."""
+        values = _flat_args(args)
+        if len(values) < 4:
+            return Response(code=cmd.RES_WRONG_ARGS,
+                            error=barracks_module.ERROR_INVALID_OPERATION)
+        pairs = []
+        rest = values[2:]
+        for index in range(0, len(rest) - 1, 2):
+            pairs.append((rest[index], rest[index + 1]))
+        return self._barracks(self.barracks.multi_respec, pairs, values[1])
+
+    def on_change_tankman_role(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_TMAN_CHANGE_ROLE`` - ``Int4 (shopRev, tmanInvID, roleIdx, vehCD)``."""
+        values = _flat_args(args)
+        return self._barracks(self.barracks.change_role, values[1], values[2],
+                              values[3] if len(values) > 3 else 0)
+
+    def on_change_tankman_passport(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_TMAN_PASSPORT`` - ``IntArr [shopRev, tmanInvID, flags, ids…]``."""
+        values = _flat_args(args)
+        if len(values) < 10:
+            return Response(code=cmd.RES_WRONG_ARGS,
+                            error=barracks_module.ERROR_INVALID_OPERATION)
+        return self._barracks(self.barracks.change_passport, values[1], values[2:])
+
+    def on_train_tankman(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_TRAINING_TMAN`` - ``Int3 (shopRev, tmanInvID, gold)``."""
+        return self._barracks(self.barracks.free_xp_to_tankman, int(args[1]), int(args[2]))
+
+    def on_add_tankman_xp(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_ADD_TMAN_XP`` - ``Int3 (tmanInvID, xp, 0)``."""
+        return self._barracks(self.barracks.add_xp, int(args[0]), int(args[1]))
 
     def on_repair(self, request_id: int, args: Sequence) -> Response:
         """``CMD_REPAIR`` - ``Int3 (vehInvID, 0, 0)``."""

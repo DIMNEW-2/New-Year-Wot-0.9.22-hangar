@@ -29,6 +29,17 @@ RES_CACHE = 2
 # --------------------------------------------------------------------------
 # Account commands (``common/AccountCommands.py``)
 # --------------------------------------------------------------------------
+#: The barracks (``common/AccountCommands.py``); the argument order of each one
+#: is the client's own ``Inventory``/``ClientRecycleBin`` helper.
+CMD_TMAN_ADD_SKILL = 151
+CMD_TMAN_DROP_SKILLS = 152
+CMD_TMAN_RESPEC = 153
+CMD_TMAN_PASSPORT = 154
+CMD_TRAINING_TMAN = 155
+CMD_TMAN_MULTI_RESPEC = 156
+CMD_RETURN_CREW = 157
+CMD_TMAN_CHANGE_ROLE = 158
+
 CMD_SYNC_DATA = 100
 CMD_EQUIP = 101
 CMD_EQUIP_OPTDEV = 102
@@ -66,8 +77,13 @@ CMD_REQ_PLAYER_INFO = 503
 
 CMD_SYNC_DOSSIERS = 600
 
+#: ``CMD_DISMISS_TMAN`` sits between the selling commands and the requests.
+CMD_DISMISS_TMAN = 306
+
 CMD_UNLOCK_ALL = 10004
+CMD_ADD_TMAN_XP = 10003
 CMD_BUY_GOODIE = 10014
+CMD_TMAN_RESTORE = 10015
 CMD_ADD_INT_USER_SETTINGS = 1600
 
 #: New Year 2018 event commands (``common/AccountCommands.py``).
@@ -191,6 +207,17 @@ __all__ = [
     "CMD_SELL_ITEM",
     "CMD_SELL_VEHICLE",
     "CMD_SET_AND_FILL_LAYOUTS",
+    "CMD_ADD_TMAN_XP",
+    "CMD_DISMISS_TMAN",
+    "CMD_RETURN_CREW",
+    "CMD_TMAN_ADD_SKILL",
+    "CMD_TMAN_CHANGE_ROLE",
+    "CMD_TMAN_DROP_SKILLS",
+    "CMD_TMAN_MULTI_RESPEC",
+    "CMD_TMAN_PASSPORT",
+    "CMD_TMAN_RESPEC",
+    "CMD_TMAN_RESTORE",
+    "CMD_TRAINING_TMAN",
     "CMD_SYNC_DATA",
     "CMD_SYNC_DOSSIERS",
     "CMD_SYNC_SHOP",

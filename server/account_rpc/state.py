@@ -209,6 +209,11 @@ class AccountState:
 
         self.vehicles: Dict[int, VehicleEntry] = {}
         self.tankmen: Dict[int, TankmanEntry] = {}
+        #: ``recycleBin.tankmen.buffer``: ``invID -> (compDescr, dismissedAt)``
+        #: of the crew members the player dismissed.  The client shows them with
+        #: a *negative* inventory id and restores them through
+        #: ``CMD_TMAN_RESTORE``.
+        self.dismissed_tankmen: Dict[int, Tuple[bytes, float]] = {}
         self.items: Dict[int, Dict[int, int]] = {}
         #: ``inventory[CUSTOMIZATION]``: the appearance items of the depot and
         #: the outfits mounted on the vehicles (see
@@ -440,6 +445,122 @@ class AccountState:
     def _vehicle_type(self, entry: VehicleEntry) -> Optional[VehicleType]:
         return self.catalog.vehicles.get(entry.compact_descr)
 
+    def vehicle_type(self, entry: Optional[VehicleEntry]) -> Optional[VehicleType]:
+        """The vehicle *type* of a garage entry (``None`` when unknown)."""
+        return self._vehicle_type(entry) if entry is not None else None
+
+    def vehicle_type_of(self, tankman: TankmanEntry) -> Optional[VehicleType]:
+        """The vehicle a crew member sits in (``None`` when it is not in one)."""
+        return self.vehicle_type(self.vehicles.get(tankman.vehicle_inv_id))
+
+    # ------------------------------------------------------------------
+    # The crew members (``server.account_rpc.barracks``)
+    # ------------------------------------------------------------------
+    def tankman_config(self, nation_id: int):
+        """The nation configuration of the crew (name/rank tables)."""
+        factory = self.tankman_factory
+        if factory is None:
+            return None
+        name = nyc.NATIONS[nation_id] if 0 <= int(nation_id) < len(nyc.NATIONS) else None
+        return factory.configs.get(name) if name else None
+
+    def tankman_descr(self, entry: TankmanEntry):
+        """A mutable ``TankmanDescr`` of one crew member, with its rank table."""
+        config = self.tankman_config(entry.nation_id)
+        rank_ids = config.role_rank_ids(entry.role) if config is not None else ()
+        return tankmen_module.TankmanDescr(entry.compact_descr, rank_ids=rank_ids)
+
+    def set_tankman_descr(self, entry: TankmanEntry, descr) -> None:
+        """Store a rewritten descriptor and refresh what the entry caches."""
+        entry.compact_descr = descr.pack()
+        entry.nation_id = int(descr.nation_id)
+        entry.role = descr.role
+        entry.role_level = int(descr.role_level)
+        config = self.tankman_config(entry.nation_id)
+        group_id = 0
+        group_name = ""
+        if config is not None:
+            groups = (config.premium_groups or config.groups) if descr.is_premium \
+                else config.groups
+            group_id = config.find_group(descr.is_female, descr.first_name_id,
+                                         descr.last_name_id, descr.icon_id,
+                                         premium=bool(descr.is_premium))
+            if 0 <= group_id < len(groups):
+                group_name = groups[group_id].name
+        entry.passport = tankmen_module.Passport(
+            nation_id=int(descr.nation_id), is_premium=bool(descr.is_premium),
+            is_female=bool(descr.is_female), first_name_id=int(descr.first_name_id),
+            last_name_id=int(descr.last_name_id), icon_id=int(descr.icon_id),
+            group_id=int(group_id), group_name=group_name)
+
+    # -- the recycle bin of the barracks --------------------------------
+    def free_berths(self) -> int:
+        """Berths the barracks still has.
+
+        Only the crew members that are *not* sitting in a vehicle take up a
+        berth - the client's own ``BarracksSlotsValidator`` counts
+        ``getTankmen(~REQ_CRITERIA.TANKMAN.IN_TANK)`` against
+        ``stats.tankmenBerthsCount``, so the server checks the same thing.
+        """
+        in_barracks = sum(1 for entry in self.tankmen.values()
+                          if entry.vehicle_inv_id in (-1, None))
+        return max(0, int(self.berths) - in_barracks)
+
+    def has_free_berth(self) -> bool:
+        return self.free_berths() > 0
+
+    def dismissed_at(self, inv_id: int) -> Optional[float]:
+        record = self.dismissed_tankmen.get(int(inv_id))
+        return None if record is None else float(record[1])
+
+    def has_dismissed_tankman(self, inv_id: int) -> bool:
+        return int(inv_id) in self.dismissed_tankmen
+
+    def dismiss_tankman(self, entry: TankmanEntry, now: float = None) -> None:
+        """Move a crew member out of the barracks into the recycle bin."""
+        self.tankmen.pop(entry.inv_id, None)
+        entry.vehicle_inv_id = -1
+        self.dismissed_tankmen[int(entry.inv_id)] = (
+            entry.compact_descr, float(now if now is not None else time.time()))
+
+    def restore_tankman(self, inv_id: int) -> TankmanEntry:
+        """Put a dismissed crew member back into the barracks."""
+        inv_id = int(inv_id)
+        record = self.dismissed_tankmen.pop(inv_id, None)
+        if record is None:
+            raise KeyError(inv_id)
+        compact_descr, _dismissed_at = record
+        descr = None
+        config = self.tankman_config(tankmen_module.parse_compact_descr(compact_descr)["nationID"])
+        rank_ids = ()
+        if config is not None:
+            role = tankmen_module.parse_compact_descr(compact_descr)["role"]
+            rank_ids = config.role_rank_ids(role) if role else ()
+        descr = tankmen_module.TankmanDescr(compact_descr, rank_ids=rank_ids)
+        entry = TankmanEntry(
+            inv_id=inv_id,
+            compact_descr=compact_descr,
+            nation_id=int(descr.nation_id),
+            vehicle_inv_id=-1,
+            role=descr.role,
+            role_level=int(descr.role_level),
+        )
+        self.tankmen[inv_id] = entry
+        self.set_tankman_descr(entry, descr)
+        return entry
+
+    def recycle_bin_diff(self, inv_ids=()) -> dict:
+        """The ``recycleBin`` section of a diff (only the named crew members)."""
+        buffer: Dict = {}
+        for inv_id in inv_ids or ():
+            inv_id = int(inv_id)
+            record = self.dismissed_tankmen.get(inv_id)
+            if record is None:
+                buffer[inv_id] = None
+            else:
+                buffer[inv_id] = (record[0], record[1])
+        return {"tankmen": {"buffer": buffer}}
+
     # ------------------------------------------------------------------
     # The New Year event
     # ------------------------------------------------------------------
@@ -615,6 +736,11 @@ class AccountState:
                 "freeXP": self.free_xp,
             },
             "tokens": dict(self.tokens),
+            # The client's ``ClientRecycleBin`` merges the sections of a diff
+            # into ``cache['recycleBin']`` and its ``RecycleBinRequester`` reads
+            # ``tankmen``/``vehicles`` from there, so the dismissed crew members
+            # travel in the sync as the descriptors they were dismissed with.
+            "recycleBin": self.recycle_bin_diff(self.dismissed_tankmen),
             "newYear": self.new_year.full_new_year_diff(),
             ("goodies", "_r"): self.new_year.goodies_diff(),
             ("serverSettings", "_r"): self.server_settings(),
@@ -1024,19 +1150,58 @@ class AccountState:
         tankman_data["invID"] = inv_id
 
     def _attach_tankman_to_vehicle(self, tankman_data: dict) -> None:
+        """Seat a granted crew member in the vehicle its bonus named.
+
+        ``TankmenBonus`` of the client only *shows* the crew member; the account
+        has to put it somewhere.  It goes into the first free seat of the
+        vehicle type the bonus named (a vehicle of its nation otherwise) whose
+        crew slot accepts its role - never next to the crew list, because the
+        client indexes the crew by slot and a list longer than the vehicle's
+        ``crewRoles`` would make it show a seat that does not exist.  Without a
+        free seat it stays in the barracks.
+        """
         inv_id = tankman_data.get("invID")
         if inv_id is None:
             return
         entry = self.tankmen.get(int(inv_id))
         if entry is None:
             return
-        for vehicle in self.vehicles.values():
-            if vehicle.compact_descr == self._vehicle_type_compact_for(entry):
-                vehicle.crew.append(entry.inv_id)
-                entry.vehicle_inv_id = vehicle.inv_id
+        compact = self._vehicle_type_compact_for(entry, tankman_data.get("vehicleTypeID"))
+        candidates = [vehicle for vehicle in self.vehicles.values()
+                      if vehicle.compact_descr == compact]
+        candidates.extend(vehicle for vehicle in self.vehicles.values()
+                          if vehicle.nation_id == entry.nation_id
+                          and vehicle not in candidates)
+        for vehicle in candidates:
+            if self.seat_tankman(entry, vehicle):
                 return
 
-    def _vehicle_type_compact_for(self, tankman: TankmanEntry) -> int:
+    def seat_tankman(self, entry: TankmanEntry, vehicle_entry: VehicleEntry,
+                     slots: Sequence[str] = None) -> bool:
+        """Seat a crew member if a slot of the vehicle's crew accepts its role."""
+        roles = list(slots) if slots is not None else self.crew_roles_of(vehicle_entry)
+        if not roles:
+            return False
+        while len(vehicle_entry.crew) < len(roles):
+            vehicle_entry.crew.append(None)
+        del vehicle_entry.crew[len(roles):]
+        for slot, slot_roles in enumerate(roles):
+            if entry.role not in slot_roles:
+                continue
+            if vehicle_entry.crew[slot] not in (-1, None):
+                continue
+            vehicle_entry.crew[slot] = entry.inv_id
+            entry.vehicle_inv_id = vehicle_entry.inv_id
+            return True
+        return False
+
+    def _vehicle_type_compact_for(self, tankman: TankmanEntry, vehicle_type_id=None) -> int:
+        """The vehicle type a crew member belongs to (the bonus may name it)."""
+        if vehicle_type_id is not None:
+            for vehicle in self.vehicles.values():
+                if (vehicle.nation_id == tankman.nation_id
+                        and vehicle.innation_id == int(vehicle_type_id)):
+                    return vehicle.compact_descr
         for vehicle in self.vehicles.values():
             if vehicle.nation_id == tankman.nation_id:
                 return vehicle.compact_descr
@@ -1093,6 +1258,10 @@ class AccountState:
                     "compactDescr": entry.compact_descr.decode("latin-1"),
                 }
                 for inv_id, entry in sorted(self.tankmen.items())
+            },
+            "dismissedTankmen": {
+                str(inv_id): [record[0].decode("latin-1"), record[1]]
+                for inv_id, record in sorted(self.dismissed_tankmen.items())
             },
             "unlocks": sorted(self.unlocks),
             "eliteVehicles": sorted(self.elite_vehicles),
@@ -1160,6 +1329,10 @@ class AccountState:
                 vehicle_inv_id=int(data.get("vehicleInvID", -1)),
             )
             state.tankmen[entry.inv_id] = entry
+        state.dismissed_tankmen = {
+            int(inv_id): (record[0].encode("latin-1"), float(record[1]))
+            for inv_id, record in (payload.get("dismissedTankmen") or {}).items()
+        }
         state.unlocks = set(payload.get("unlocks") or ())
         state.elite_vehicles = set(payload.get("eliteVehicles") or ())
         state.veh_type_xp = {int(compact): int(xp)

@@ -23,9 +23,29 @@ plain Python 2 protocol-2 pickles.
 | `ping` | — | keep-alive (the server answers `pong`) |
 | `bye` | — | the client is going away |
 
-`code` is the client's own `AccountCommands` value (`100` sync, `20161`–`20169`
+`code` is the client's own `AccountCommands` value (`100` sync, `151`–`158` and
+`306`/`10015` the barracks, `116`–`119` the appearance window, `20161`–`20169`
 the New Year commands, `300` shop sync, …); `args` is a tuple because the mod
 sends `len(args)` values of the matching `doCmd*` helper.
+
+The barracks commands come from `client/account_helpers/Inventory.py`
+(`dismissTankman`, `addTankmanSkill`, …) and `client_recycle_bin.py`
+(`restoreTankman`); the arguments are theirs and the answer carries the rewritten
+`inventory[8]['compDescr'][invID]` in its diff:
+
+| code | `args` | answer |
+| --- | --- | --- |
+| `CMD_DISMISS_TMAN` (306) | `Int3 (tmanInvID, 0, 0)` | the crew member leaves `inventory[8]`, and `recycleBin.tankmen.buffer[invID]` carries `(compDescr, dismissedAt)` |
+| `CMD_TMAN_RESTORE` (10015) | `Int3 (tmanInvID, 0, 0)` | the reverse; the bin entry becomes `None` |
+| `CMD_DISMISS_TMAN`/`CMD_RETURN_CREW` (157) | `Int3 (vehInvID, 0, 0)` for the crew | the seats travel as `inventory[1]['crew']` |
+| `CMD_TMAN_ADD_SKILL` (151) | `Int3 (tmanInvID, skillIdx, 0)` | |
+| `CMD_TMAN_DROP_SKILLS` (152) | `Int3 (shopRev, tmanInvID, costIdx)` | |
+| `CMD_TMAN_RESPEC` (153) | `Int4 (shopRev, tmanInvID, costIdx, vehTypeCompDescr)` | |
+| `CMD_TMAN_PASSPORT` (154) | `IntArr [shopRev, tmanInvID, isPremium, isFemale, fnGroup, first, lnGroup, last, iGroup, icon]` | |
+| `CMD_TRAINING_TMAN` (155) | `Int3 (shopRev, tmanInvID, gold)` | the gold the convert window computed |
+| `CMD_TMAN_MULTI_RESPEC` (156) | `IntArr [shopRev, vehTypeCompDescr, invID, costIdx, …]` | |
+| `CMD_TMAN_CHANGE_ROLE` (158) | `Int4 (shopRev, tmanInvID, roleIdx, vehTypeCompDescr)` | `ext` is an `EQUIP_TMAN_CODE` |
+| `CMD_ADD_TMAN_XP` (10003) | `Int3 (tmanInvID, xp, 0)` | |
 
 ## Server → client
 
