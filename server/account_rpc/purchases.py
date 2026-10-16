@@ -152,6 +152,14 @@ class Shopkeeper(object):
     def _pay(self, credits: int) -> None:
         self.state.credits += max(0, int(credits))
 
+    #: Public faces of the two wallet helpers, for the other keepers of the
+    #: account (the customization window charges and refunds the same way).
+    def charge(self, credits: int = 0, gold: int = 0) -> None:
+        self._charge(credits=credits, gold=gold)
+
+    def refund(self, credits: int) -> None:
+        self._pay(credits)
+
     def vehicle_type(self, compact_descr: int):
         vehicle = self.state.catalog.vehicles.get(compact_descr)
         if vehicle is None:

@@ -19,10 +19,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import common  # noqa: E402
 from server.account_rpc import commands as cmd  # noqa: E402
 from server.account_rpc.requests import RequestDispatcher  # noqa: E402
+from server.game import customization as c11n  # noqa: E402
+from server.game import items as items_module  # noqa: E402
 from server.game import ny_constants as nyc  # noqa: E402
 from server.game.new_year import NewYearError  # noqa: E402
-from server.game.events import EVENT_CLIENT_DATA  # noqa: E402
+from server.game.events import EVENT_CLIENT_DATA, REWARD_SEASONS  # noqa: E402
 from server.proto import py2_loads  # noqa: E402
+
+VEHICLE = items_module.ITEM_TYPES["vehicle"]
+TANKMAN = items_module.ITEM_TYPES["tankman"]
 import zlib  # noqa: E402
 
 
@@ -279,6 +284,111 @@ def test_select_discount_and_tankman(runner: common.Runner) -> None:
 
     response = client.select_tankman(nation_id + 100, vehicle.innation_id, role_id, token)
     runner.check(response.code != cmd.RES_SUCCESS, "an unknown nation is refused")
+
+
+def test_a_box_vehicle_and_a_tankwoman_reach_the_inventory(runner: common.Runner) -> None:
+    """What a box grants the account has to travel in the same diff.
+
+    The client only learns about a reward from the diff of the answer that
+    granted it (there is no push), so a granted premium and a recruited
+    tankwoman have to show up in ``inventory`` right away - otherwise the new
+    tank appears only after the next full sync.
+    """
+    from server.game import new_year as ny_module
+
+    client, state = _client(runner)
+    box_id = sorted(state.catalog.new_year.boxes)[0]
+    client.add_token(box_id)
+    saved = dict(ny_module.BOX_LOOT)
+    ny_module.BOX_LOOT["vehicle_chance"] = 1.0
+    ny_module.BOX_LOOT["tankman_chance"] = 1.0
+    vehicles_before = set(state.vehicles)
+    tankmen_before = set(state.tankmen)
+    try:
+        response = client.open_box(box_id)
+    finally:
+        ny_module.BOX_LOOT.clear()
+        ny_module.BOX_LOOT.update(saved)
+    runner.equal(response.code, cmd.RES_SUCCESS, "the box is opened")
+
+    granted_vehicles = sorted(set(state.vehicles) - vehicles_before)
+    granted_tankmen = sorted(set(state.tankmen) - tankmen_before)
+    runner.check(granted_vehicles, "the box granted a vehicle")
+    runner.check(granted_tankmen, "and a tankwoman")
+    inventory = client.diff.get("inventory") or {}
+    descrs = (inventory.get(VEHICLE) or {}).get("compDescr") or {}
+    for inv_id in granted_vehicles:
+        runner.check(inv_id in descrs, "vehicle %s travels in the diff" % inv_id)
+        runner.check(descrs[inv_id], "with its descriptor")
+    crew = (inventory.get(TANKMAN) or {}).get("compDescr") or {}
+    for inv_id in granted_tankmen:
+        runner.check(inv_id in crew, "tankman %s travels in the diff" % inv_id)
+    runner.check("unlocks" in (client.diff.get("stats") or {}),
+                 "the research table of the garage travels with a new vehicle")
+    message = response.actions[0]["data"]["data"]
+    runner.check(message.get("vehicles"), "the system message names the vehicle")
+    runner.check(message.get("tankmen"), "and the tankwoman")
+    for entry in message["vehicles"]:
+        runner.check(all(isinstance(key, int) for key in entry),
+                     "a vehicles bonus is keyed by the vehicle's compact descriptor")
+        for compact in entry:
+            runner.equal(state.catalog.vehicles.get(compact) is not None, True,
+                         "the type descriptor %s is a real vehicle" % compact)
+
+
+def test_a_collection_reward_hands_out_its_camouflages(runner: common.Runner) -> None:
+    """A completed collection pays its camouflages into the depot.
+
+    The reward is the bonus of its own hidden quest - the system message of the
+    box only lists the quest ids it completed - so the items of that quest are
+    what the account has to book, and the client shows exactly them.
+    """
+    client, state = _client(runner)
+    setting_id = nyc.NATIONAL_SETTINGS_IDS_BY_NAME["soviet"]
+    state.new_year.state.collection_ratings[setting_id] = 100  # level MAX_COLLECTION_LEVEL
+    box_id = sorted(state.catalog.new_year.boxes)[0]
+    client.add_token(box_id)
+
+    response = client.open_box(box_id)
+    runner.equal(response.code, cmd.RES_SUCCESS, "the box is opened")
+    message = response.actions[0]["data"]["data"]
+    reward_id = state.catalog.new_year.collection_reward_by_setting["soviet"]
+    runner.check(reward_id in message["completedQuestIDs"], "the collection reward is named")
+
+    runner.equal(client.diff.get("newYear", {}).get("collectionRewards"), [reward_id],
+                 "the diff reports the completed collection")
+    # What the client shows is the bonus of the reward's own quest, which it
+    # already has from the sync of ``eventsData`` (the quests are built from the
+    # installation and never change).
+    quests = state.events.quests()
+    bonus = (quests.get(reward_id) or {}).get("bonus") or {}
+    items = bonus.get("customizations") or []
+    runner.equal(len(items), 3, "the reward is a camouflage for every season")
+    depot = ((client.diff.get("inventory") or {}).get(12) or {}).get(1) or {}
+    for item in items:
+        runner.equal(item.get("custType"), "camouflage", "the bonus names the item type")
+        catalogue_item = state.catalog.customization.get(
+            c11n.make_int_descr(c11n.TYPE_CAMOUFLAGE, item["id"]))
+        runner.check(catalogue_item is not None,
+                     "camouflage %s exists in the installation" % item["id"])
+        if catalogue_item is None:
+            continue
+        runner.check(catalogue_item.is_vehicle_bound() and catalogue_item.not_in_shop,
+                     "it is one of the event camouflages")
+        runner.equal(catalogue_item.nations, (nyc.NATION_INDICES["ussr"],),
+                     "and it belongs to the setting's nation")
+        runner.equal(state.customization.count(c11n.TYPE_CAMOUFLAGE, item["id"], 0), 1,
+                     "it is in the depot")
+        runner.equal(depot.get(c11n.TYPE_CAMOUFLAGE, {}).get(item["id"]), {0: 1},
+                     "and the diff publishes it")
+    seasons = []
+    for item in items:
+        found = state.catalog.customization.get(
+            c11n.make_int_descr(c11n.TYPE_CAMOUFLAGE, item["id"]))
+        if found is not None:
+            seasons.append(found.season)
+    runner.equal(sorted(seasons), sorted(REWARD_SEASONS),
+                 "one camouflage per season, and no season twice")
 
 
 def test_state_can_be_saved_and_restored(runner: common.Runner) -> None:

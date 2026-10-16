@@ -27,6 +27,8 @@ import zlib
 from typing import Dict, List, Optional
 
 from ..proto import py2_dumps
+from . import customization as c11n
+from . import ny_constants as nyc
 from .catalog import Catalog
 
 #: ``common/constants.py`` - ``EVENT_CLIENT_DATA``.
@@ -216,7 +218,8 @@ class EventDataBuilder:
                 "startTime": self.start_time - 3600,
                 "finishTime": self.start_time + EVENT_DURATION,
                 "bonus": {
-                    "customizations": COLLECTION_REWARD_CUSTOMIZATIONS.get(reward.setting, []),
+                    "customizations": collection_reward_customizations(
+                        self.catalog.customization, reward.setting),
                     "tokens": {reward.id: {"expires": {"at": None}, "count": 1}},
                 },
                 "conditions": self._conditions(),
@@ -411,18 +414,37 @@ CHEST_QUESTS = {
     10: {"credits": 15000, "gold": 25, "ny18Toys": []},
 }
 
-#: Customization items of the collection rewards, per national setting.  The
-#: client resolves the ids against its own ``item_defs/customization`` data.
-COLLECTION_REWARD_CUSTOMIZATIONS = {
-    "soviet": [{"custType": "camouflage", "id": 1, "value": 1}],
-    "traditionalWestern": [{"custType": "camouflage", "id": 1, "value": 1}],
-    "modernWestern": [{"custType": "camouflage", "id": 1, "value": 1}],
-    "asian": [{"custType": "camouflage", "id": 1, "value": 1}],
-}
+#: The ``SeasonType`` values a collection reward's camouflage set covers (the
+#: event camouflages of ``item_defs/customization`` come in three per nation).
+REWARD_SEASONS = (c11n.SEASON_WINTER, c11n.SEASON_SUMMER, c11n.SEASON_DESERT)
+
+
+def collection_reward_customizations(catalogue, setting: str) -> List[dict]:
+    """The camouflage a collection reward of one setting hands out.
+
+    The live server's own reward table is not part of the client, so the local
+    one takes the installation's event camouflages (``vehicleBound`` and not in
+    the shop) of the setting's nation - one per season - and names their *real*
+    ids: the client resolves every entry against its own items cache
+    (``CustomizationsBonusFormatter`` -> ``ICustomizationService.getItemByID``),
+    and an id it cannot find breaks the awards window.
+    """
+    nations = [nyc.NATION_INDICES[name]
+               for name in nyc.NATIONS_BY_SETTING.get(setting, ()) if name in nyc.NATION_INDICES]
+    rewards = []
+    for season in REWARD_SEASONS:
+        found = catalogue.event_camouflages(nations, season)
+        if not found:
+            continue
+        rewards.append({"custType": c11n.TYPE_NAMES[c11n.TYPE_CAMOUFLAGE],
+                        "id": int(found[0].id), "value": 1})
+    return rewards
 
 
 __all__ = [
     "CHEST_QUESTS",
+    "REWARD_SEASONS",
+    "collection_reward_customizations",
     "CMD_CHANGE_HANGAR",
     "CMD_CHANGE_HANGAR_AMBIENT",
     "CMD_CHANGE_HANGAR_MUSIC",

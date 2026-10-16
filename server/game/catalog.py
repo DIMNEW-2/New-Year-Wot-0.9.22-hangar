@@ -143,6 +143,7 @@ class NyCatalog:
             self.chest_id_by_level[chest.level] = chest.id
 
         self.collection_reward_by_setting = {reward.setting: reward.id for reward in self.collection_rewards}
+        self.collection_reward_by_id = {reward.id: reward for reward in self.collection_rewards}
 
         self.toy_groups: Dict[int, List[int]] = {}
         for toy in self.toys.values():
@@ -860,9 +861,17 @@ class VehicleCatalog:
 # Combined catalog
 # --------------------------------------------------------------------------
 class Catalog:
-    def __init__(self, new_year: NyCatalog, vehicles: VehicleCatalog, meta: dict = None):
+    def __init__(self, new_year: NyCatalog, vehicles: VehicleCatalog,
+                 customization: "CustomizationCatalog" = None, meta: dict = None):
         self.new_year = new_year
         self.vehicles = vehicles
+        # The appearance items of the installation (paints, camouflages, decals,
+        # modifications and styles); empty when the installation ships none.
+        if customization is None:
+            from .customization import CustomizationCatalog
+
+            customization = CustomizationCatalog()
+        self.customization = customization
         self.meta = meta or {}
 
     @property
@@ -874,22 +883,26 @@ class Catalog:
         self.new_year.validate()
 
     def to_json(self) -> dict:
+        vehicles = self.vehicles.to_json()
         payload = {
-            "schema": 1,
+            "schema": 2,
             "generatedBy": "New-Year-Wot-0.9.22-hangar",
             "clientBuild": self.meta.get("clientBuild", "0.9.22.0.1 #1513"),
             "newYear": self.new_year.to_json(),
-            "vehicles": self.vehicles.to_json()["vehicles"],
-            "extraPrices": self.vehicles.to_json()["extraPrices"],
-            "shells": self.vehicles.to_json()["shells"],
-            "devices": self.vehicles.to_json()["devices"],
+            "vehicles": vehicles["vehicles"],
+            "extraPrices": vehicles["extraPrices"],
+            "shells": vehicles["shells"],
+            "devices": vehicles["devices"],
+            "customization": self.customization.to_json(),
         }
         return payload
 
     @classmethod
     def from_json(cls, payload: dict) -> "Catalog":
-        if int(payload.get("schema", 0)) != 1:
+        if int(payload.get("schema", 0)) not in (1, 2):
             raise CatalogError("unsupported catalog schema: %r" % (payload.get("schema"),))
+        from .customization import CustomizationCatalog
+
         new_year = NyCatalog.from_json(payload["newYear"])
         vehicles = VehicleCatalog.from_json(
             {
@@ -899,7 +912,10 @@ class Catalog:
                 "devices": payload.get("devices", ()),
             }
         )
-        return cls(new_year, vehicles, payload)
+        # An export of schema 1 has no appearance items; the catalogue then
+        # simply knows none (the shop publishes no customization prices).
+        customization = CustomizationCatalog.from_json(payload.get("customization") or {})
+        return cls(new_year, vehicles, customization, payload)
 
     @classmethod
     def load(cls, source: DefsSource) -> "Catalog":
@@ -907,9 +923,11 @@ class Catalog:
         exported = source.json_payload()
         if exported is not None:
             return cls.from_json(exported)
+        from .customization import CustomizationCatalog
+
         new_year = load_ny_catalog(source)
         vehicles = load_vehicle_catalog(source)
-        return cls(new_year, vehicles)
+        return cls(new_year, vehicles, CustomizationCatalog.load(source))
 
 
 # --------------------------------------------------------------------------

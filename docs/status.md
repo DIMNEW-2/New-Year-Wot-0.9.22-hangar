@@ -69,7 +69,18 @@ What works today, and what is still missing or unverified.
   a stale count in the client).
 * **Loot reports** — opening a box or a chest pushes a `tokenQuests` system
   message (chat action 21) with the rewards, exactly what
-  `_NewYearBoxStorage.__handleSysMsg` expects.
+  `_NewYearBoxStorage.__handleSysMsg` expects.  What the reward grants the
+  account (a premium with its crew, a recruited tankwoman, the camouflages of a
+  completed collection) is booked and published in the diff of the same answer,
+  because the client only learns about it from a diff.
+* **The appearance window** — the depot (`inventory['customization']['items']`,
+  keyed by vehicle type for the `vehicleBound` items), the mounted outfits
+  (`['outfits']`, the `SeasonType.ALL` entry being the style) and the four
+  commands: buy (118, unbound or bound to the named vehicle, `notInShop`
+  refused), sell (117, refunded at `ceil(0.5 * (credits + gold * 400))`), mount
+  an outfit (119, the missing items bought, the replaced ones returned to the
+  depot) and apply/rent/remove a style (116, `rentCount` battles as the bound
+  count, the style published as the `ALL` season).
 * **Research is inert.**  The local garage grants every researchable vehicle
   (`researchable`), so the client's own `UnlockItemValidator` refuses to send
   `CMD_UNLOCK` (`already_unlocked`); the handler answers the requests that still
@@ -105,19 +116,30 @@ What works today, and what is still missing or unverified.
   client's battle commands (`CMD_ENQUEUE_*`, the platoon/`CMD_PRB_*` family, the
   queue info requests) are answered with ``unknown_command``, so the buttons
   that lead into a battle report a server error instead of doing nothing.
-* **The appearance UI (customization) is half done.**  The data is read:
-  `server/game/customization.py` knows every paint, camouflage and decal of the
-  installation with the price of its `<price>` or of the price group it names,
-  its season mask, its `notInShop` flag and its nation/level/tag filter, and
-  `tests/test_customization.py` checks it against the client's own numbering
-  (`makeIntCompactDescrByID('customizationItem', cType, itemId)`).  What is still
-  missing is the account side of it: `inventory['customization']` (the
-  `CustomizationInvData` sections `ITEMS`/`OUTFITS`/`UNLOCKS`) is not published,
-  the item prices are not part of the shop cache yet, and the four commands the
-  client sends - `CMD_BUY_C11N_ITEMS` (118), `CMD_SELL_C11N_ITEMS` (117),
-  `CMD_VEH_APPLY_OUTFIT` (119), `CMD_VEH_APPLY_STYLE` (116) - have no handlers.
-  Camouflage rewards that the New Year bonuses name are therefore only shown,
-  not handed out.
+* **The appearance UI (customization) is not verified in the client.**  Both
+  halves are implemented: the catalogue (`server/game/customization.py` - every
+  paint, camouflage, decal, modification and style with its price group, season
+  mask, `notInShop` flag and nation/level/tag filter, checked against the
+  client's own numbering by `tools/check_client_assets.py`) and the account side
+  (`server/account_rpc/customization.py` - the `ITEMS`/`OUTFITS`/`UNLOCKS`
+  sections of `inventory['customization']`, the depot, the mounted outfits and
+  the four commands 116-119, driven by `tests/test_customization.py` through the
+  same dispatcher the socket uses).  What is *not* proven is how the client's own
+  window renders it: the outfit descriptor codec
+  (`server/game/c11n_outfit.py`) is a re-implementation of
+  `common/items/customizations.py`, and the one thing that cannot be derived from
+  the client is which items the *live* server hands out (the event camouflages of
+  the New Year rewards are taken from the installation's own
+  `item_defs/customization` instead - see below).
+* **The New Year reward tables are the installation's own.**  The live game
+  decides what a box, a chest or a completed collection hands out in server-side
+  data that is not part of the client.  Where the client does not care about the
+  exact item (money, decorations, premium days) the local server rolls its own
+  table (`server/game/new_year.py::BOX_LOOT`/`CHEST_LOOT`); a collection reward
+  names *real* camouflage ids, so it takes the event camouflages of the
+  installation (`server/game/events.py::collection_reward_customizations`, the
+  `vehicleBound` and `notInShop` ones of the setting's nation) - an id the
+  client's items cache does not know would break its awards window.
 * **The barracks commands are not implemented yet** (`CMD_DISMISS_TMAN`,
   `CMD_TMAN_ADD_SKILL`, `CMD_TMAN_CHANGE_ROLE`, `CMD_TMAN_RESPEC`,
   `CMD_TMAN_DROP_SKILLS`, `CMD_TMAN_MULTI_RESPEC`, `CMD_TMAN_RESTORE`,

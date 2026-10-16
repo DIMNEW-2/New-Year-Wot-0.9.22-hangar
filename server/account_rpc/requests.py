@@ -36,6 +36,7 @@ from typing import List, Optional, Sequence, Tuple
 from ..game import new_year as ny_module
 from ..proto import pack_stream, py2_dumps
 from . import commands as cmd
+from . import customization as customization_module
 from . import data as data_module
 from . import economics as economics_module
 from . import garage as garage_module
@@ -89,6 +90,34 @@ def flat_pairs(values: Sequence[int]) -> List[Tuple[int, int]]:
     return result
 
 
+def _flat_args(args: Sequence) -> List[int]:
+    """The ints of a request that may arrive flat or wrapped in one list."""
+    if len(args) == 1 and isinstance(args[0], (list, tuple)):
+        return [_as_int(value) for value in args[0]]
+    values = []
+    for value in args:
+        if isinstance(value, (list, tuple)):
+            values.extend(_as_int(item) for item in value)
+        else:
+            values.append(_as_int(value))
+    return values
+
+
+def _split_arrays(args: Sequence) -> Tuple[List[int], List]:
+    """``(intArr, strArr)`` of ``_doCmdIntArrStrArr`` requests."""
+    if len(args) == 2 and isinstance(args[0], (list, tuple)) \
+            and isinstance(args[1], (list, tuple)):
+        return ([_as_int(value) for value in args[0]], list(args[1]))
+    return (_flat_args(args), [])
+
+
+def _as_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
 class RequestDispatcher:
     """Handles the commands the local server knows how to serve."""
 
@@ -97,6 +126,7 @@ class RequestDispatcher:
         self.log = logger or LOG
         self.shop = purchases_module.Shopkeeper(state)
         self.garage = garage_module.Garage(state)
+        self.customization = customization_module.CustomizationKeeper(state, self.shop)
         self.wallet = economics_module.Wallet(state)
         self._message_id = 0
         self._handlers = {
@@ -119,6 +149,10 @@ class RequestDispatcher:
             cmd.CMD_REPAIR: self.on_repair,
             cmd.CMD_VEH_SETTINGS: self.on_change_setting,
             cmd.CMD_SET_AND_FILL_LAYOUTS: self.on_set_and_fill_layouts,
+            cmd.CMD_VEH_APPLY_STYLE: self.on_apply_style,
+            cmd.CMD_SELL_C11N_ITEMS: self.on_sell_c11n_items,
+            cmd.CMD_BUY_C11N_ITEMS: self.on_buy_c11n_items,
+            cmd.CMD_VEH_APPLY_OUTFIT: self.on_apply_outfit,
             cmd.CMD_UNLOCK: self.on_unlock,
             cmd.CMD_EXCHANGE: self.on_exchange,
             cmd.CMD_FREE_XP_CONV: self.on_free_xp_conv,
@@ -351,14 +385,64 @@ class RequestDispatcher:
         cost_index = int(args[3]) if len(args) > 3 else 0
         return self._purchase(self.garage.buy_and_equip_tankman, veh_inv_id, slot, cost_index)
 
+    # -- the customization window ---------------------------------------
+    def on_buy_c11n_items(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_BUY_C11N_ITEMS`` - ``[rev, vehInvID, intCD, count, …]``.
+
+        ``Shop.buyCustomizations`` writes the pairs of its ``{intCD: count}``
+        table into one flat array, so an odd tail would be a request the client
+        never makes - it is refused rather than half served.
+        """
+        values = _flat_args(args)
+        if len(values) < 3 or (len(values) - 2) % 2:
+            return Response(code=cmd.RES_WRONG_ARGS,
+                            error=customization_module.ERROR_WRONG_ARGS)
+        pairs = [(int(values[index]), int(values[index + 1]))
+                 for index in range(2, len(values) - 1, 2)]
+        return self._purchase(self.customization.buy, int(values[1]), pairs)
+
+    def on_sell_c11n_items(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_SELL_C11N_ITEMS`` - ``Int4 (rev, itemCD, count, vehInvID)``."""
+        compact = int(args[1])
+        count = int(args[2]) if len(args) > 2 else 1
+        veh_inv_id = int(args[3]) if len(args) > 3 else 0
+        return self._purchase(self.customization.sell, compact, count, veh_inv_id)
+
+    def on_apply_style(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_VEH_APPLY_STYLE`` - ``Int3 (rev, vehInvID, styleID)``."""
+        veh_inv_id = int(args[1]) if len(args) > 1 else 0
+        style_id = int(args[2]) if len(args) > 2 else 0
+        return self._purchase(self.customization.apply_style, veh_inv_id, style_id)
+
+    def on_apply_outfit(self, request_id: int, args: Sequence) -> Response:
+        """``CMD_VEH_APPLY_OUTFIT`` - ``[rev, vehInvID, season]`` + ``[outfitDescr]``.
+
+        The outfit travels as the *string* ``Outfit.pack().makeCompDescr()``
+        produced on the client (``Shop.buyAndEquipOutfit``), which is why the
+        request is the one command of the account with two argument arrays.
+        """
+        ints, strings = _split_arrays(args)
+        if len(ints) < 3 or not strings:
+            return Response(code=cmd.RES_WRONG_ARGS,
+                            error=customization_module.ERROR_WRONG_ARGS)
+        return self._purchase(self.customization.apply_outfit,
+                              int(ints[1]), int(ints[2]), strings[0])
+
     # -- New Year event -------------------------------------------------
     def _new_year_response(self, result: ny_module.NewYearResult, diffs: int = 1,
                            events_data: bool = False) -> Response:
-        """Apply an event result: one diff plus the ``tokenQuests`` sys message."""
-        self.state.apply_new_year_result(result)
+        """Apply an event result: one diff plus the ``tokenQuests`` sys message.
+
+        Whatever the result granted (a box vehicle, a recruited tankwoman, the
+        camouflage of a collection reward) is booked on the account first and
+        then published in the same diff - the client's caches only read diffs,
+        so without it the reward would only appear after the next full sync.
+        """
+        granted = self.state.apply_new_year_result(result)
         diff = self.state.incremental_diff(
             result, events_data=events_data or bool(result.chest_loot)
         )
+        diff.update(self.state.granted_account_diff(granted))
         response = Response(ext={"newYear": dict(diff.get("newYear", {}))}, diffs=[diff])
         if result.bonuses is not None:
             response.actions.append(
@@ -390,12 +474,9 @@ class RequestDispatcher:
         variadic_id = str(args[1][0])
         result = self.state.new_year.select_tankman(nation_id, vehicle_innation_id, role_id, variadic_id)
         self.log.info("tankwoman recruited for nation %s (role %s)", nation_id, role_id)
-        response = self._new_year_response(result)
-        # The new crew member has to appear in the barracks right away, so the
-        # inventory travels with the same diff (the client's
-        # ``ClientNewYear``/barracks read it from there).
-        response.diffs[0]["inventory"] = {8: self.state.tankman_inventory_diff()}
-        return response
+        # The new crew member (and the tank she was seated on) travels in the
+        # diff of the answer itself, so the barracks shows her right away.
+        return self._new_year_response(result)
 
     def on_craft(self, request_id: int, args: Sequence) -> Response:
         toy_type, setting_id, rank = (int(value) for value in args)

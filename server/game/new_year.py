@@ -352,7 +352,13 @@ class NewYearEvent:
         return stored, new_toys, fragments
 
     def _grant_collection_rewards(self) -> List[str]:
-        """Hand out a setting's collection reward when its level is maxed."""
+        """Hand out a setting's collection reward when its level is maxed.
+
+        The reward itself is the installation's own set of event camouflages of
+        that setting (see :func:`server.game.events.collection_reward_customizations`);
+        it travels as the ``customizations`` bonus of the answer, which is what
+        the client's sys message and its awards window read.
+        """
         granted = []
         for reward in self.catalog.collection_rewards:
             if reward.id in self.state.collection_rewards:
@@ -361,6 +367,7 @@ class NewYearEvent:
                 self.state.collection_rewards.add(reward.id)
                 granted.append(reward.id)
         return granted
+
 
     def _set_level(self, level: int) -> Optional[NewYearResult]:
         """Grant everything an atmosphere level unlocks (chest, discount, crew)."""

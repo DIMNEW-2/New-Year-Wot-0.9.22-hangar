@@ -130,13 +130,26 @@ def build_shop(catalog: Catalog, revision: int = SHOP_REV) -> dict:
     """The whole shop cache for ``CMD_SYNC_SHOP``.
 
     Every item the client can buy is priced from the installation's own
-    ``item_defs``: vehicles and their modules, shells, equipment and optional
-    devices.  ``defaults`` publishes the same tables, so a dialog that reads the
-    fallback shows exactly what the local server charges.
+    ``item_defs``: vehicles and their modules, shells, equipment, optional
+    devices and the appearance items (paints, camouflages, decals, modifications
+    and styles).  ``defaults`` publishes the same tables, so a dialog that reads
+    the fallback shows exactly what the local server charges.
     """
     prices = catalog.vehicles.item_prices()
+    # ``FittingItem`` reads the price of a customization item out of the shop
+    # cache like every other item (``shop.getItem``/``shop.defaults.getItemPrice``)
+    # and the customization window prices its baskets with it, so the appearance
+    # items travel in the same table.
+    prices.update(catalog.customization.prices())
+    not_in_shop = set(catalog.customization.not_in_shop())
     items = _empty_items(prices)
     defaults = _empty_items(prices)
+    if not_in_shop:
+        # ``DefaultShopRequester.getHiddens`` is the list the UI greys out; the
+        # appearance items the client's own data marks ``notInShop`` (the legacy
+        # camouflages of the event, the ``all`` styles) are not for sale.
+        items["notInShopItems"] = set(not_in_shop)
+        defaults["notInShopItems"] = set(not_in_shop)
     defaults.update(
         {
             "slotsPrices": SLOTS_PRICES,

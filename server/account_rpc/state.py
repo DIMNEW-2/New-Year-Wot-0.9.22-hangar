@@ -10,7 +10,9 @@ match the shape the client's helpers read:
                         ``eliteVehicles``, ``vehTypeXP``, ``slots``,
                         ``berths``, ``freeXP``, ``vehicles`` ...
 ``diff['inventory']``   ``{itemType: {'compDescr': {...}, ...}}`` for vehicles
-                        and tankmen, ``{intCD: count}`` for the rest
+                        and tankmen, ``{intCD: count}`` for the rest, and the
+                        appearance section (``ITEMS``/``OUTFITS``) for the
+                        customization window and the outfits of the vehicles
 ``diff['tokens']``      ``{token: (expiryTime, count)}``
 ``diff['newYear']``     the New Year state (``ClientNewYear.synchronize``)
 ``diff[('eventsData','_r')]`` / ``diff['eventsData']``
@@ -39,7 +41,10 @@ from ..game import rewards as rewards_module
 from ..game import tankmen as tankmen_module
 from ..game import vehicle_descr as descr_module
 from ..game import catalog as catalog_module
+from ..game import customization as c11n_types
+from . import customization as customization_module
 from ..game.catalog import Catalog, VehicleType
+from ..game import events as events_module
 from ..game.events import EventDataBuilder
 
 #: ``GUI_ITEM_TYPE`` indexes of the client (``gui.shared.gui_items``).
@@ -205,6 +210,10 @@ class AccountState:
         self.vehicles: Dict[int, VehicleEntry] = {}
         self.tankmen: Dict[int, TankmanEntry] = {}
         self.items: Dict[int, Dict[int, int]] = {}
+        #: ``inventory[CUSTOMIZATION]``: the appearance items of the depot and
+        #: the outfits mounted on the vehicles (see
+        #: :mod:`server.account_rpc.customization`).
+        self.customization = customization_module.CustomizationInventory()
         #: What the last diff published per item type (see :meth:`_item_section`).
         self._published_items: Dict[int, Dict[int, int]] = {}
         self.tokens: Dict[str, Tuple[Optional[int], int]] = {}
@@ -474,6 +483,11 @@ class AccountState:
 
         for item_type, values in self.items.items():
             inventory[item_type] = dict(values)
+        # The appearance items: the depot and the outfits of every vehicle.  A
+        # full sync publishes the whole section, which is also what makes the
+        # client's caches and this account start from the same state.
+        inventory[customization_module.CUSTOMIZATION_INVENTORY] = \
+            self.customization.full_sections()
         return inventory
 
     def tankman_inventory_diff(self) -> dict:
@@ -830,9 +844,17 @@ class AccountState:
         self.events.set_new_year_state(state)
         self.revision += 1
 
-    def apply_new_year_result(self, result: ny_module.NewYearResult) -> None:
-        """Book the side effects of an event action on the account itself."""
+    def apply_new_year_result(self, result: ny_module.NewYearResult) -> dict:
+        """Book the side effects of an event action on the account itself.
+
+        Returns what the account *gained* (``vehicles``/``tankmen`` inventory ids
+        and the appearance items, as ``(cType, itemID)`` pairs), because the
+        client only learns from a diff: the caller publishes it with
+        :meth:`granted_account_diff`.
+        """
         bonuses = result.bonuses or {}
+        before_vehicles = set(self.vehicles)
+        before_tankmen = set(self.tankmen)
         if "credits" in bonuses:
             self.credits += int(bonuses["credits"])
         if "gold" in bonuses:
@@ -848,24 +870,131 @@ class AccountState:
         if "tankmen" in bonuses and isinstance(bonuses["tankmen"], list):
             for tankman_data in bonuses["tankmen"]:
                 self._attach_tankman_to_vehicle(tankman_data)
+        granted_items = []
+        for item_data in bonuses.get("customizations", ()) or ():
+            item = self._grant_customization_bonus(item_data)
+            if item is not None:
+                granted_items.append(item)
+        # A collection reward is the bonus of *its own* quest - the system message
+        # of the box only names the quest ids it completed - so those items come
+        # from the quest, not from the box.
+        for item_data in self._collection_reward_items(bonuses.get("completedQuestIDs")):
+            item = self._grant_customization_bonus(item_data)
+            if item is not None:
+                granted_items.append(item)
         if result.chest_loot:
             # The client shows a chest's reward from its hidden quest, so the
             # loot of this opening has to reach ``eventsData`` (see
             # ``EventDataBuilder.set_chest_loot``).
             self.events.set_chest_loot(result.chest_loot)
+        return {
+            "vehicles": sorted(set(self.vehicles) - before_vehicles),
+            "tankmen": sorted(set(self.tankmen) - before_tankmen),
+            "customizations": granted_items,
+        }
 
-    def _grant_vehicle_bonus(self, vehicle_data: dict) -> None:
-        """Add a vehicle the event granted.
+    def granted_account_diff(self, granted: dict) -> dict:
+        """The ``inventory``/``stats`` sections of what a result just granted.
 
-        The sys message carries the vehicle as ``{'typeCompDescr': cd, ...}``
-        (see ``ClientNewYear.__extractBonuses`` -> ``VehiclesBonus``), so the
-        server only has to find the type in the catalogue.
+        A reward the account books itself (a box vehicle with its crew, a
+        recruited tankwoman, the camouflage of a collection reward) is invisible
+        to the client until its caches are told about it, and they only read
+        diffs - so every piece of the reward travels in the answer that granted
+        it: the vehicles (with their crew lists, because a result may seat a
+        recruited crew member on a tank), the crew members and the depot entries
+        of the appearance items.
         """
-        compact = vehicle_data.get("typeCompDescr")
-        vehicle = self.catalog.vehicles.get(int(compact)) if compact else None
-        if vehicle is None:
+        inventory: Dict = {}
+        tankman_inv_ids = [int(inv_id) for inv_id in (granted.get("tankmen") or ())]
+        vehicle_inv_ids = [int(inv_id) for inv_id in (granted.get("vehicles") or ())]
+        for inv_id in tankman_inv_ids:
+            entry = self.tankmen.get(inv_id)
+            if entry is not None and entry.vehicle_inv_id not in (-1, None):
+                vehicle_inv_ids.append(int(entry.vehicle_inv_id))
+        if vehicle_inv_ids or tankman_inv_ids:
+            for key, value in self.partial_inventory_diff(
+                    vehicle_inv_ids=vehicle_inv_ids,
+                    tankman_inv_ids=tankman_inv_ids).items():
+                if value:
+                    inventory[key] = value
+        item_types = [(int(c_type), int(item_id))
+                      for c_type, item_id in (granted.get("customizations") or ())]
+        if item_types:
+            section = self.customization.sections(item_types=item_types)
+            if section:
+                inventory[customization_module.CUSTOMIZATION_INVENTORY] = section
+        sections: Dict = {}
+        if inventory:
+            sections["inventory"] = inventory
+        if granted.get("vehicles"):
+            # A new vehicle is research/XP bookkeeping of the account as well
+            # (``Stats.synchronize`` grows ``unlocks``/``eliteVehicles`` and
+            # reads ``vehTypeXP``).
+            sections["stats"] = self.purchase_stats_diff()
+        return sections
+
+    def _collection_reward_items(self, completed_quest_ids) -> List[dict]:
+        """The appearance items of the collection rewards among the quest ids.
+
+        A collection reward is the camouflage set of the setting's nation, taken
+        from the installation itself (``item_defs/customization`` marks them
+        ``vehicleBound`` and keeps them out of the shop) - the live server's own
+        reward table is not part of the client, see
+        :func:`server.game.events.collection_reward_customizations`.
+        """
+        rewards = getattr(self.catalog.new_year, "collection_reward_by_id", {})
+        items: List[dict] = []
+        for quest_id in completed_quest_ids or ():
+            reward = rewards.get(str(quest_id))
+            if reward is None:
+                continue
+            items.extend(events_module.collection_reward_customizations(
+                self.catalog.customization, reward.setting))
+        return items
+
+    def _grant_customization_bonus(self, item_data: dict) -> Optional[Tuple[int, int]]:
+        """Put one appearance item of a reward into the depot.
+
+        The payload of a reward is the client's own
+        (``gui/server_events/bonuses.py::CustomizationsBonus``): ``custType`` is
+        the item type name, ``id`` the item id and ``value`` the count, plus an
+        optional ``vehTypeCompDescr`` that binds it to a vehicle.  An item the
+        installation does not know is dropped - the client would not be able to
+        show it either.
+        """
+        c_type = c11n_types.TYPE_IDS_BY_NAME.get(str(item_data.get("custType")))
+        item_id = int(item_data.get("id", 0) or 0)
+        count = int(item_data.get("value", 1) or 1)
+        if c_type is None or count <= 0:
+            return None
+        if self.catalog.customization.get(c11n_types.make_int_descr(c_type, item_id)) is None:
+            return None
+        vehicle_type = int(item_data.get("vehTypeCompDescr", 0) or 0)
+        self.customization.add(c_type, item_id, count, vehicle_type)
+        return (c_type, item_id)
+
+    def _grant_vehicle_bonus(self, vehicle_data) -> None:
+        """Add the vehicles one ``vehicles`` bonus of the event names.
+
+        The payload is what ``VehiclesBonus.getVehicles`` walks: a dictionary
+        ``{typeCompDescr: {'crewLvl': ..., 'noCrew': ...}}`` (the box and chest
+        bonuses of ``ClientNewYear`` go out as a *list* of those).  A vehicle the
+        account already owns is left alone - the client finds it in its garage by
+        the type descriptor anyway.
+        """
+        if not isinstance(vehicle_data, dict):
             return
-        self.add_vehicle(vehicle)
+        compacts = [key for key in vehicle_data if isinstance(key, int)]
+        if not compacts and vehicle_data.get("typeCompDescr"):
+            # The quest flavour of the same bonus names the type explicitly.
+            compacts = [int(vehicle_data["typeCompDescr"])]
+            vehicle_data = {compacts[0]: vehicle_data}
+        for compact in compacts:
+            vehicle = self.catalog.vehicles.get(int(compact))
+            if vehicle is None or vehicle.compact_descr in self.owned_vehicle_comp_descrs():
+                continue
+            info = vehicle_data.get(compact) or {}
+            self.add_vehicle(vehicle, crew=not info.get("noCrew", False))
 
     def _grant_tankman_bonus(self, tankman_data: dict) -> None:
         if self.tankman_factory is None:
@@ -972,6 +1101,7 @@ class AccountState:
                 str(item_type): {str(cd): count for cd, count in values.items()}
                 for item_type, values in self.items.items()
             },
+            "customization": self.customization.to_json(),
             "newYear": self.new_year.state.to_json(),
         }
 
@@ -1040,6 +1170,8 @@ class AccountState:
         }
         state._published_items = {item_type: dict(values)
                                   for item_type, values in state.items.items() if values}
+        state.customization = customization_module.CustomizationInventory.from_json(
+            payload.get("customization") or {})
         state.new_year.state = ny_module.NewYearState.from_json(payload.get("newYear") or {}, catalog.new_year)
         state.new_year.tankmen = tankman_factory
         state.sync_tokens()
